@@ -46,7 +46,8 @@ def normalize_country_name(name: str) -> str:
         "япония": "japan", "франция": "france", "великобритания": "united kingdom",
         "сингапур": "singapore", "нидерланды": "netherlands", "канада": "canada",
         "швейцария": "switzerland", "швеция": "sweden", "австралия": "australia",
-        "бразилия": "brazil", "индия": "india", "южная корея": "south korea"
+        "бразилия": "brazil", "индия": "india", "южная корея": "south korea",
+        "турция": "turkey", "тайвань": "taiwan", "швейцария": "switzerland"
     }
     return ru_en_map.get(name, name)
 
@@ -110,7 +111,8 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         # Удаление временного файла
         if 'file_path' in context.user_data:
-            os.unlink(context.user_data['file_path'])
+            if os.path.exists(context.user_data['file_path']):
+                os.unlink(context.user_data['file_path'])
             del context.user_data['file_path']
     
     # Поиск релевантных конфигов
@@ -182,7 +184,9 @@ def detect_by_keywords(config: str) -> str:
         'brazil': [r'🇧🇷', r'brazil', r'sao paulo', r'\.br\b', r'巴西'],
         'singapore': [r'🇸🇬', r'singapore', r'\.sg\b', r'新加坡'],
         'south korea': [r'🇰🇷', r'korea', r'seoul', r'\.kr\b', r'韩国'],
-        'turkey': [r'🇹🇷', r'turkey', r'istanbul', r'\.tr\b', r'土耳其']
+        'turkey': [r'🇹🇷', r'turkey', r'istanbul', r'\.tr\b', r'土耳其'],
+        'taiwan': [r'🇹🇼', r'taiwan', r'taipei', r'\.tw\b', r'台湾'],
+        'switzerland': [r'🇨🇭', r'switzerland', r'zurich', r'\.ch\b', r'瑞士']
     }
     
     # Проверка по убыванию приоритета
@@ -268,14 +272,20 @@ def main() -> None:
     
     # Настройка веб-сервера для Render.com
     port = int(os.environ.get('PORT', 5000))
-    webhook_url = f"https://{os.environ.get('RENDER_APP_NAME')}.onrender.com/{TOKEN}"
+    external_host = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
     
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        webhook_url=webhook_url,
-        url_path=TOKEN
-    )
+    if external_host:
+        # Режим вебхуков для Render.com
+        webhook_url = f"https://{external_host}/webhook"
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            webhook_url=webhook_url,
+            url_path="webhook"
+        )
+    else:
+        # Режим polling для локальной разработки
+        application.run_polling()
 
 if __name__ == "__main__":
     main()
