@@ -28,7 +28,7 @@ GEOIP_API = "http://ip-api.com/json/"
 HEADERS = {'User-Agent': 'Telegram V2Ray Config Bot/1.0'}
 STRICT_MODE = True  # Режим строгой проверки конфигов
 MAX_WORKERS = 5  # Максимальное количество потоков для проверки
-MAX_CONFIGS_TO_CHECK = 100  # Максимальное количество конфигов для строгой проверки
+CHUNK_SIZE = 100  # Размер сектора для обработки конфигов
 
 # Состояния диалога
 WAITING_FILE, WAITING_COUNTRY = range(2)
@@ -168,19 +168,40 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Предварительно найдено {len(prelim_configs)} конфигов для {country.name}, обработка заняла {time.time()-start_time:.2f} сек")
     
-    # Если конфигов слишком много, берем только часть для строгой проверки
-    if len(prelim_configs) > MAX_CONFIGS_TO_CHECK:
-        prelim_configs = prelim_configs[:MAX_CONFIGS_TO_CHECK]
-        logger.info(f"Ограничение: для строгой проверки взято {MAX_CONFIGS_TO_CHECK} конфигов")
-    
-    # Строгая проверка конфигов - этап 2
+    # Строгая проверка конфигов - этап 2 (секторами)
     strict_matched_configs = []
     if STRICT_MODE and prelim_configs:
-        await update.message.reply_text(f"🔍 Начинаю строгую проверку {len(prelim_configs)} конфигов...")
+        total_chunks = (len(prelim_configs) + CHUNK_SIZE - 1) // CHUNK_SIZE
+        await update.message.reply_text(
+            f"🔍 Начинаю строгую проверку {len(prelim_configs)} конфигов секторами по {CHUNK_SIZE}...\n"
+            f"Всего секторов: {total_chunks}"
+        )
         
         start_time = time.time()
-        strict_matched_configs = strict_config_check(prelim_configs, target_country)
-        logger.info(f"Строгая проверка завершена: найдено {len(strict_matched_configs)} конфигов, заняло {time.time()-start_time:.2f} сек")
+        for chunk_idx in range(0, len(prelim_configs), CHUNK_SIZE):
+            chunk = prelim_configs[chunk_idx:chunk_idx + CHUNK_SIZE]
+            chunk_start_time = time.time()
+            
+            # Проверяем текущий сектор
+            valid_configs = strict_config_check(chunk, target_country)
+            strict_matched_configs.extend(valid_configs)
+            
+            # Отправляем промежуточные результаты
+            chunk_end_time = time.time()
+            chunk_time = chunk_end_time - chunk_start_time
+            await update.message.reply_text(
+                f"✅ Сектор {chunk_idx//CHUNK_SIZE + 1}/{total_chunks} обработан\n"
+                f"Найдено конфигов: {len(valid_configs)}\n"
+                f"Время обработки: {chunk_time:.1f} сек\n"
+                f"Всего найдено: {len(strict_matched_configs)}"
+            )
+            
+            # Отправляем сами конфиги, если они есть
+            if valid_configs:
+                await send_configs(update, valid_configs, country.name)
+        
+        total_time = time.time() - start_time
+        logger.info(f"Строгая проверка завершена: найдено {len(strict_matched_configs)} конфигов, заняло {total_time:.2f} сек")
     
     matched_configs = strict_matched_configs if STRICT_MODE else prelim_configs
     
@@ -189,39 +210,37 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Конфигурации для {country.name} не найдены.")
         return ConversationHandler.END
     
-    # Форматирование и отправка с разбивкой на сообщения
-    header = f"Конфиги для {country.name} ({len(matched_configs)} шт):\n"
-    current_message = header
-    sent_messages = 0
+    # Отправляем все оставшиеся конфиги (если не в строгом режиме)
+    if not STRICT_MODE:
+        await send_configs(update, matched_configs, country.name)
     
-    for i, config in enumerate(matched_configs):
+    logger.info(f"Всего отправлено {len(matched_configs)} конфигов для {country.name}")
+    await update.message.reply_text(f"✅ Готово! Всего найдено {len(matched_configs)} конфигов для {country.name}.")
+    return ConversationHandler.END
+
+async def send_configs(update: Update, configs: list, country_name: str):
+    """Отправляет конфиги пользователю с разбивкой на сообщения"""
+    header = f"Конфиги для {country_name}:\n"
+    current_message = header
+    
+    for i, config in enumerate(configs):
         config_line = f"{config}\n"
         
         if len(current_message) + len(config_line) > MAX_MSG_LENGTH:
             try:
                 await update.message.reply_text(f"<pre>{current_message}</pre>", parse_mode='HTML')
-                sent_messages += 1
                 current_message = header + config_line
             except Exception as e:
                 logger.error(f"Ошибка отправки сообщения: {e}")
                 current_message = header + config_line
         else:
             current_message += config_line
-        
-        # Логируем прогресс каждые 50 конфигов
-        if i % 50 == 0 and i > 0:
-            logger.info(f"Форматирование: обработано {i}/{len(matched_configs)} конфигов...")
     
     if len(current_message) > len(header):
         try:
             await update.message.reply_text(f"<pre>{current_message}</pre>", parse_mode='HTML')
-            sent_messages += 1
         except Exception as e:
             logger.error(f"Ошибка отправки финального сообщения: {e}")
-    
-    logger.info(f"Отправлено {sent_messages} сообщений с {len(matched_configs)} конфигами для {country.name}")
-    await update.message.reply_text(f"✅ Готово! Найдено {len(matched_configs)} конфигов для {country.name}.")
-    return ConversationHandler.END
 
 def is_config_relevant(config: str, target_country: str, aliases: list, country_codes: list) -> bool:
     """Быстрая проверка конфига на релевантность стране"""
@@ -256,10 +275,6 @@ def strict_config_check(configs: list, target_country: str) -> list:
             config, is_valid = future.result()
             if is_valid:
                 valid_configs.append(config)
-            
-            # Логирование прогресса
-            if (i+1) % 10 == 0:
-                logger.info(f"Проверено {i+1}/{len(configs)} конфигов...")
     
     return valid_configs
 
