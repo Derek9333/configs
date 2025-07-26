@@ -6,6 +6,7 @@ import base64
 import json
 import pycountry
 import requests
+import time
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -81,7 +82,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_memory(tmp_file)
         context.user_data['file_path'] = tmp_file.name
     
-    logger.info(f"Пользователь {user.id} загрузил файл: {document.file_name}")
+    logger.info(f"Пользователь {user.id} загрузил файл: {document.file_name} ({document.file_size} байт)")
     await update.message.reply_text(
         "✅ Файл получен. Теперь введите название страны (на русском или английском):"
     )
@@ -89,21 +90,35 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает запрос страны и выдает результаты"""
+    user = update.message.from_user
     country_request = update.message.text
+    logger.info(f"Пользователь {user.id} запросил страну: {country_request}")
+    
     normalized_name = normalize_country_name(country_request)
+    logger.info(f"Нормализованное название страны: {normalized_name}")
     
     try:
         # Попытка определить страну через pycountry
         country = pycountry.countries.search_fuzzy(normalized_name)[0]
         target_country = country.name.lower()
+        logger.info(f"Определена страна: {country.name} (целевое название: {target_country})")
     except LookupError:
+        logger.warning(f"Страна не распознана: {country_request}")
         await update.message.reply_text("❌ Страна не распознана. Пожалуйста, уточните название.")
         return ConversationHandler.END
     
     # Чтение и обработка файла
+    file_path = context.user_data.get('file_path')
+    if not file_path or not os.path.exists(file_path):
+        logger.error("Путь к файлу не найден или файл отсутствует")
+        await update.message.reply_text("❌ Ошибка: файл конфигурации не найден.")
+        return ConversationHandler.END
+    
     try:
-        with open(context.user_data['file_path'], 'r', encoding='utf-8') as f:
+        start_time = time.time()
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             configs = f.read().splitlines()
+        logger.info(f"Файл прочитан: {len(configs)} строк, за {time.time()-start_time:.2f} сек")
     except Exception as e:
         logger.error(f"Ошибка чтения файла: {e}")
         await update.message.reply_text("❌ Ошибка обработки файла. Проверьте формат.")
@@ -111,19 +126,33 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         # Удаление временного файла
         if 'file_path' in context.user_data:
-            if os.path.exists(context.user_data['file_path']):
-                os.unlink(context.user_data['file_path'])
+            file_path = context.user_data['file_path']
+            if os.path.exists(file_path):
+                os.unlink(file_path)
             del context.user_data['file_path']
     
     # Поиск релевантных конфигов
+    start_time = time.time()
     matched_configs = []
-    for config in configs:
+    for i, config in enumerate(configs):
         if not config.strip():
             continue
         
-        config_country = identify_country(config)
-        if config_country and target_country == config_country:
-            matched_configs.append(config)
+        try:
+            config_country = identify_country(config)
+            if config_country and (target_country in config_country or 
+                                  config_country in target_country or
+                                  any(alias in config_country for alias in get_country_aliases(target_country))):
+                matched_configs.append(config)
+        except Exception as e:
+            logger.error(f"Ошибка обработки конфига #{i}: {e}")
+            continue
+        
+        # Логируем прогресс каждые 1000 конфигов
+        if i % 1000 == 0 and i > 0:
+            logger.info(f"Обработано {i}/{len(configs)} конфигов...")
+    
+    logger.info(f"Найдено {len(matched_configs)} конфигов для {country.name}, обработка заняла {time.time()-start_time:.2f} сек")
     
     # Отправка результатов
     if not matched_configs:
@@ -131,23 +160,55 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     
     # Форматирование и отправка с разбивкой на сообщения
-    header = f"конфиги: {country.name}\n"
+    header = f"Конфиги для {country.name}:\n"
     current_message = header
+    sent_messages = 0
     
-    for config in matched_configs:
+    for i, config in enumerate(matched_configs):
         config_line = f"{config}\n"
         
         if len(current_message) + len(config_line) > MAX_MSG_LENGTH:
-            await update.message.reply_text(f"```\n{current_message}\n```", parse_mode='MarkdownV2')
-            current_message = header + config_line
+            try:
+                await update.message.reply_text(f"<pre>{current_message}</pre>", parse_mode='HTML')
+                sent_messages += 1
+                current_message = header + config_line
+            except Exception as e:
+                logger.error(f"Ошибка отправки сообщения: {e}")
+                current_message = header + config_line
         else:
             current_message += config_line
+        
+        # Логируем прогресс каждые 50 конфигов
+        if i % 50 == 0 and i > 0:
+            logger.info(f"Форматирование: обработано {i}/{len(matched_configs)} конфигов...")
     
     if len(current_message) > len(header):
-        await update.message.reply_text(f"```\n{current_message}\n```", parse_mode='MarkdownV2')
+        try:
+            await update.message.reply_text(f"<pre>{current_message}</pre>", parse_mode='HTML')
+            sent_messages += 1
+        except Exception as e:
+            logger.error(f"Ошибка отправки финального сообщения: {e}")
     
-    logger.info(f"Отправлено {len(matched_configs)} конфигов для {country.name}")
+    logger.info(f"Отправлено {sent_messages} сообщений с {len(matched_configs)} конфигами для {country.name}")
+    await update.message.reply_text(f"✅ Готово! Найдено {len(matched_configs)} конфигов для {country.name}.")
     return ConversationHandler.END
+
+def get_country_aliases(country_name: str) -> list:
+    """Возвращает список альтернативных названий для страны"""
+    aliases = {
+        "united states": ["usa", "us", "сша", "америка"],
+        "russia": ["россия", "ru", "rf", "русский"],
+        "germany": ["германия", "de", "германи"],
+        "united kingdom": ["great britain", "uk", "gb", "англия", "британия"],
+        "france": ["франция", "fr"],
+        "japan": ["япония", "jp", "японии"],
+        "brazil": ["бразилия", "br"],
+        "south korea": ["korea", "southkorea", "sk", "корея", "кр"],
+        "turkey": ["турция", "tr", "турецкий"],
+        "taiwan": ["тайвань", "tw", "тайваня"],
+        "switzerland": ["швейцария", "ch"]
+    }
+    return aliases.get(country_name, [])
 
 def identify_country(config: str) -> str:
     """Определяет страну для конфигурации с использованием нескольких методов"""
@@ -166,10 +227,13 @@ def identify_country(config: str) -> str:
     if not host:
         return None
     
-    # Метод 3: Геолокация по IP
+    # Метод 3: Геолокация по IP (осторожно, медленный!)
     country_name = geolocate_host(host)
-    geo_cache[config] = country_name
-    return country_name
+    if country_name:
+        geo_cache[config] = country_name
+        return country_name
+    
+    return None
 
 def detect_by_keywords(config: str) -> str:
     """Определение страны по ключевым словам в конфиге"""
@@ -186,7 +250,10 @@ def detect_by_keywords(config: str) -> str:
         'south korea': [r'🇰🇷', r'korea', r'seoul', r'\.kr\b', r'韩国'],
         'turkey': [r'🇹🇷', r'turkey', r'istanbul', r'\.tr\b', r'土耳其'],
         'taiwan': [r'🇹🇼', r'taiwan', r'taipei', r'\.tw\b', r'台湾'],
-        'switzerland': [r'🇨🇭', r'switzerland', r'zurich', r'\.ch\b', r'瑞士']
+        'switzerland': [r'🇨🇭', r'switzerland', r'zurich', r'\.ch\b', r'瑞士'],
+        'india': [r'🇮🇳', r'india', r'mumbai', r'\.in\b', r'индия'],
+        'canada': [r'🇨🇦', r'canada', r'toronto', r'\.ca\b', r'канада'],
+        'australia': [r'🇦🇺', r'australia', r'sydney', r'\.au\b', r'австралия']
     }
     
     # Проверка по убыванию приоритета
@@ -205,11 +272,12 @@ def extract_host(config: str) -> str:
             # Декодирование base64
             encoded = config.split('://')[1].split('?')[0]
             padding = '=' * (-len(encoded) % 4)
-            decoded = base64.b64decode(encoded + padding).decode('utf-8')
+            decoded = base64.b64decode(encoded + padding).decode('utf-8', errors='replace')
             json_data = json.loads(decoded)
             return json_data.get('host') or json_data.get('add', '')
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Ошибка декодирования VMESS/VLESS: {e}")
+            return None
     
     # Для форматов типа host:port
     host_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', config)
@@ -230,19 +298,30 @@ def geolocate_host(host: str) -> str:
         if re.match(r'(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)', host):
             return None
         
+        # Пропускаем домены без IP
+        if not re.match(r'\d+\.\d+\.\d+\.\d+', host):
+            return None
+        
+        # Проверяем кэш
+        if host in geo_cache:
+            return geo_cache[host]
+        
         response = requests.get(f"{GEOIP_API}{host}", headers=HEADERS, timeout=3)
         data = response.json()
         if data.get('status') == 'success':
-            return data.get('country', '').lower()
-    except Exception:
-        pass
+            country = data.get('country', '').lower()
+            geo_cache[host] = country
+            return country
+    except Exception as e:
+        logger.debug(f"Ошибка геолокации для {host}: {e}")
     return None
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отменяет текущий диалог"""
     if 'file_path' in context.user_data:
-        if os.path.exists(context.user_data['file_path']):
-            os.unlink(context.user_data['file_path'])
+        file_path = context.user_data['file_path']
+        if os.path.exists(file_path):
+            os.unlink(file_path)
         del context.user_data['file_path']
     
     await update.message.reply_text("Операция отменена.")
@@ -277,6 +356,7 @@ def main() -> None:
     if external_host:
         # Режим вебхуков для Render.com
         webhook_url = f"https://{external_host}/webhook"
+        logger.info(f"Запуск в режиме webhook: {webhook_url}")
         application.run_webhook(
             listen="0.0.0.0",
             port=port,
@@ -285,6 +365,7 @@ def main() -> None:
         )
     else:
         # Режим polling для локальной разработки
+        logger.info("Запуск в режиме polling")
         application.run_polling()
 
 if __name__ == "__main__":
