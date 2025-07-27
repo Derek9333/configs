@@ -671,10 +671,10 @@ def detect_by_keywords(config: str, target_country: str) -> bool:
         'colombia': [r'colombia', r'bogota', r'\.co\b', r'哥伦比亚', r'波哥大'],
         'peru': [r'peru', r'lima', r'\.pe\b', r'秘鲁', r'利马'],
         'chile': [r'chile', r'santiago', r'\.cl\b', r'智利', r'圣地亚哥'],
-        'venezuela': [r'venezuela', r'caracas', r'\.ve\b', r'委内瑞拉', r'加拉加斯'],
-        'austria': [r'austria', r'vienna', r'\.at\b', r'奥地利', r'维也纳'],
-        'belgium': [r'belgium', r'brussels', r'\.be\b', r'比利时', r'布鲁塞尔'],
-        'ireland': [r'ireland', r'dublin', r'\.ie\b', r'爱尔兰', r'都柏林']
+        'venezuela': [r'venezuela', r'caracas', r'\.ve\b', r'委内瑞拉', r'加拉加ス'],
+        "austria": [r'austria', r'vienna', r'\.at\b', r'奥地利', r'维也纳'],
+        "belgium": [r'belgium', r'brussels', r'\.be\b', r'比利时', r'布鲁塞尔'],
+        "ireland": [r'ireland', r'dublin', r'\.ie\b', r'爱尔兰', r'都柏林']
     }
     if target_country in patterns:
         for pattern in patterns[target_country]:
@@ -726,16 +726,8 @@ async def cancel(update: Update, context: CallbackContext):
     return ConversationHandler.END
 
 def main() -> None:
-    # Исправление: создаем приложение с явным указанием update_queue
-    from telegram.ext._updater import Updater
-    from telegram.ext import ApplicationBuilder
-    
-    application = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .updater(Updater(bot=None, update_queue=None))
-        .build()
-    )
+    # Исправление: создаем приложение без явного указания updater
+    application = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("check_configs", check_configs)],
