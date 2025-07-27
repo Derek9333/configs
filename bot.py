@@ -9,6 +9,7 @@ import requests
 import time
 import socket
 import concurrent.futures
+import spacy
 from urllib.parse import urlparse
 from telegram import Update
 from telegram.ext import (
@@ -44,22 +45,92 @@ logger = logging.getLogger(__name__)
 geo_cache = {}
 dns_cache = {}
 
-def normalize_country_name(name: str) -> str:
-    """Нормализует название страны для сопоставления"""
-    name = name.lower().strip()
+# Глобальная переменная для модели Spacy
+nlp_model = None
+
+def load_spacy_model():
+    """Загружает модель Spacy для NER при первом использовании"""
+    global nlp_model
+    if nlp_model is None:
+        try:
+            nlp_model = spacy.load("en_core_web_sm")
+            logger.info("Модель Spacy успешно загружена")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки модели Spacy: {e}")
+    return nlp_model
+
+def normalize_text(text: str) -> str:
+    """Нормализует текст, заменяя названия стран на английские эквиваленты"""
+    text = text.lower().strip()
     
-    # Замена русских названий на английские
+    # Расширенный словарь замен (русские -> английские)
     ru_en_map = {
-        "россия": "russia", "сша": "united states", "германия": "germany",
-        "япония": "japan", "франция": "france", "великобритания": "united kingdom",
-        "сингапур": "singapore", "нидерланды": "netherlands", "канада": "canada",
-        "швейцария": "switzerland", "швеция": "sweden", "австралия": "australia",
-        "бразилия": "brazil", "индия": "india", "южная корея": "south korea",
-        "турция": "turkey", "тайвань": "taiwan", "швейцария": "switzerland",
-        "юар": "south africa", "оаэ": "united arab emirates", "саудовская аравия": "saudi arabia",
-        "израиль": "israel", "мексика": "mexico", "аргентина": "argentina"
+        "россия": "russia", "русский": "russia", "рф": "russia", "ру": "russia",
+        "сша": "united states", "америка": "united states", "usa": "united states", 
+        "us": "united states", "соединенные штаты": "united states",
+        "германия": "germany", "дойчланд": "germany", "deutschland": "germany", "де": "germany",
+        "япония": "japan", "японии": "japan", "jp": "japan", "яп": "japan",
+        "франция": "france", "фр": "france", "франс": "france",
+        "великобритания": "united kingdom", "брит": "united kingdom", "англия": "united kingdom", 
+        "gb": "united kingdom", "uk": "united kingdom", "гб": "united kingdom",
+        "сингапур": "singapore", "sg": "singapore", "синг": "singapore",
+        "нидерланды": "netherlands", "голландия": "netherlands", "nl": "netherlands", "нл": "netherlands",
+        "канада": "canada", "ca": "canada", "кан": "canada",
+        "швейцария": "switzerland", "ch": "switzerland", "швейц": "switzerland",
+        "швеция": "sweden", "se": "sweden", "швед": "sweden",
+        "австралия": "australia", "оз": "australia", "au": "australia", "австр": "australia",
+        "бразилия": "brazil", "br": "brazil", "браз": "brazil",
+        "индия": "india", "in": "india", "инд": "india",
+        "южная корея": "south korea", "кр": "south korea", "sk": "south korea", 
+        "корея": "south korea", "кор": "south korea",
+        "турция": "turkey", "tr": "turkey", "тур": "turkey",
+        "тайвань": "taiwan", "tw": "taiwan", "тайв": "taiwan",
+        "юар": "south africa", "sa": "south africa", "африка": "south africa",
+        "оаэ": "united arab emirates", "эмираты": "united arab emirates", 
+        "uae": "united arab emirates", "арабские": "united arab emirates",
+        "саудовская аравия": "saudi arabia", "сауд": "saudi arabia", 
+        "ksa": "saudi arabia", "саудовская": "saudi arabia",
+        "израиль": "israel", "il": "israel", "изр": "israel",
+        "мексика": "mexico", "mx": "mexico", "мекс": "mexico",
+        "аргентина": "argentina", "ar": "argentina", "арг": "argentina",
+        "италия": "italy", "it": "italy", "ит": "italy",
+        "испания": "spain", "es": "spain", "исп": "spain",
+        "португалия": "portugal", "pt": "portugal", "порт": "portugal",
+        "норвегия": "norway", "no": "norway", "норв": "norway",
+        "финляндия": "finland", "fi": "finland", "фин": "finland",
+        "дания": "denmark", "dk": "denmark", "дан": "denmark",
+        "польша": "poland", "pl": "poland", "пол": "poland",
+        "украина": "ukraine", "ua": "ukraine", "укр": "ukraine",
+        "беларусь": "belarus", "by": "belarus", "бел": "belarus",
+        "китай": "china", "cn": "china", "кнр": "china",
+        "индонезия": "indonesia", "id": "indonesia", "индо": "indonesia",
+        "малайзия": "malaysia", "my": "malaysia", "малай": "malaysia",
+        "филиппины": "philippines", "ph": "philippines", "фил": "philippines",
+        "вьетнам": "vietnam", "vn": "vietnam", "вьет": "vietnam",
+        "тайланд": "thailand", "th": "thailand", "тай": "thailand",
+        "чехия": "czech republic", "cz": "czech republic", "чех": "czech republic",
+        "румыния": "romania", "ro": "romania", "рум": "romania",
+        "венгрия": "hungary", "hu": "hungary", "венг": "hungary",
+        "греция": "greece", "gr": "greece", "грец": "greece",
+        "болгария": "bulgaria", "bg": "bulgaria", "болг": "bulgaria",
+        "египет": "egypt", "eg": "egypt", "егип": "egypt",
+        "нигерия": "nigeria", "ng": "nigeria", "нигер": "nigeria",
+        "кения": "kenya", "ke": "kenya", "кен": "kenya",
+        "колумбия": "colombia", "co": "colombia", "колумб": "colombia",
+        "перу": "peru", "pe": "peru",
+        "чили": "chile", "cl": "chile",
+        "венесуэла": "venezuela", "ve": "venezuela", "венес": "venezuela",
+        "австрия": "austria", "at": "austria", "австр": "austria",
+        "бельгия": "belgium", "be": "belgium", "бельг": "belgium",
+        "ирландия": "ireland", "ie": "ireland", "ирл": "ireland"
     }
-    return ru_en_map.get(name, name)
+    
+    # Сортируем ключи по длине (от длинных к коротким)
+    sorted_keys = sorted(ru_en_map.keys(), key=len, reverse=True)
+    for key in sorted_keys:
+        text = text.replace(key, ru_en_map[key])
+    
+    return text
 
 async def check_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Инициирует процесс проверки конфигов"""
@@ -103,15 +174,20 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country_request = update.message.text
     logger.info(f"Пользователь {user.id} запросил страну: {country_request}")
     
-    normalized_name = normalize_country_name(country_request)
-    logger.info(f"Нормализованное название страны: {normalized_name}")
+    normalized_text = normalize_text(country_request)
+    logger.info(f"Нормализованный текст: {normalized_text}")
+    
+    country = None
+    aliases = []
+    country_codes = []
+    target_country = None
     
     try:
         # Попытка определить страну через pycountry
-        countries = pycountry.countries.search_fuzzy(normalized_name)
+        countries = pycountry.countries.search_fuzzy(normalized_text)
         country = countries[0]
         target_country = country.name.lower()
-        logger.info(f"Определена страна: {country.name} (целевое название: {target_country})")
+        logger.info(f"Определена страна через pycountry: {country.name} (целевое название: {target_country})")
         
         # Получаем альтернативные названия и коды стран
         aliases = get_country_aliases(target_country)
@@ -119,9 +195,61 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         logger.info(f"Альтернативы страны: {aliases}, коды: {country_codes}")
     except LookupError:
-        logger.warning(f"Страна не распознана: {country_request}")
-        await update.message.reply_text("❌ Страна не распознана. Пожалуйста, уточните название.")
-        return ConversationHandler.END
+        logger.warning(f"Страна не распознана pycountry: {country_request}")
+        # Попытка извлечь страну через NER
+        nlp = load_spacy_model()
+        if nlp:
+            try:
+                doc = nlp(normalized_text)
+                logger.info(f"Извлеченные сущности: {[(ent.text, ent.label_) for ent in doc.ents]}")
+                
+                found_countries = []
+                for ent in doc.ents:
+                    if ent.label_ in ['GPE', 'COUNTRY']:
+                        try:
+                            # Ищем страну по названию сущности
+                            countries_list = pycountry.countries.search_fuzzy(ent.text)
+                            if countries_list:
+                                country_obj = countries_list[0]
+                                found_countries.append(country_obj.name)
+                                logger.info(f"Найдена страна через NER: {ent.text} -> {country_obj.name}")
+                        except LookupError:
+                            continue
+                
+                if found_countries:
+                    # Убираем дубликаты, сохраняя порядок
+                    seen = set()
+                    unique_countries = [c for c in found_countries if c not in seen and not seen.add(c)]
+                    
+                    if len(unique_countries) == 1:
+                        country_name = unique_countries[0]
+                        logger.info(f"Одна страна найдена через NER: {country_name}")
+                    else:
+                        # Если несколько стран, выбираем первую
+                        country_name = unique_countries[0]
+                        logger.info(f"Несколько стран найдено через NER, выбрана: {country_name}")
+                    
+                    # Получаем объект страны
+                    country = pycountry.countries.search_fuzzy(country_name)[0]
+                    target_country = country.name.lower()
+                    aliases = get_country_aliases(target_country)
+                    country_codes = [country.alpha_2.lower()]
+                    logger.info(f"Страна определена через NER: {country.name}")
+                    
+                    await update.message.reply_text(
+                        f"🌍 Страна определена через контекст: {country.name}"
+                    )
+                else:
+                    logger.warning("Не удалось определить страну через NER")
+                    await update.message.reply_text("❌ Страна не распознана. Пожалуйста, уточните название.")
+                    return ConversationHandler.END
+            except Exception as e:
+                logger.error(f"Ошибка NER: {e}")
+                await update.message.reply_text("❌ Ошибка обработки запроса. Попробуйте еще раз.")
+                return ConversationHandler.END
+        else:
+            await update.message.reply_text("❌ Ошибка обработки запроса. Попробуйте еще раз.")
+            return ConversationHandler.END
     
     # Чтение и обработка файла
     file_path = context.user_data.get('file_path')
@@ -387,7 +515,35 @@ def get_country_aliases(country_name: str) -> list:
         "canada": ["ca", "канада"],
         "australia": ["au", "австралия", "oz"],
         "singapore": ["sg", "сингапур"],
-        "italy": ["it", "италия", "italia"]
+        "italy": ["it", "италия", "italia"],
+        "spain": ["es", "испания"],
+        "portugal": ["pt", "португалия"],
+        "norway": ["no", "норвегия"],
+        "finland": ["fi", "финляндия"],
+        "denmark": ["dk", "дания"],
+        "poland": ["pl", "польша"],
+        "ukraine": ["ua", "украина"],
+        "belarus": ["by", "беларусь"],
+        "indonesia": ["id", "индонезия"],
+        "malaysia": ["my", "малайзия"],
+        "philippines": ["ph", "филиппины"],
+        "vietnam": ["vn", "вьетнам"],
+        "thailand": ["th", "тайланд"],
+        "czech republic": ["cz", "чехия"],
+        "romania": ["ro", "румыния"],
+        "hungary": ["hu", "венгрия"],
+        "greece": ["gr", "греция"],
+        "bulgaria": ["bg", "болгария"],
+        "egypt": ["eg", "египет"],
+        "nigeria": ["ng", "нигерия"],
+        "kenya": ["ke", "кения"],
+        "colombia": ["co", "колумбия"],
+        "peru": ["pe", "перу"],
+        "chile": ["cl", "чили"],
+        "venezuela": ["ve", "венесуэла"],
+        "austria": ["at", "австрия"],
+        "belgium": ["be", "бельгия"],
+        "ireland": ["ie", "ирландия"]
     }
     return aliases.get(country_name.lower(), [])
 
@@ -411,7 +567,35 @@ def detect_by_keywords(config: str, target_country: str, aliases: list) -> bool:
         'canada': [r'🇨🇦', r'canada', r'toronto', r'\.ca\b', r'加拿大', r'多倫多'],
         'australia': [r'🇦🇺', r'australia', r'sydney', r'\.au\b', r'澳洲', r'悉尼'],
         'china': [r'🇨🇳', r'china', r'beijing', r'\.cn\b', r'中国', r'北京'],
-        'italy': [r'🇮🇹', r'italy', r'rome', r'\.it\b', r'意大利', r'羅馬']
+        'italy': [r'🇮🇹', r'italy', r'rome', r'\.it\b', r'意大利', r'羅馬'],
+        'spain': [r'🇪🇸', r'spain', r'madrid', r'\.es\b', r'西班牙', r'马德里'],
+        'portugal': [r'🇵🇹', r'portugal', r'lisbon', r'\.pt\b', r'葡萄牙', r'里斯本'],
+        'norway': [r'🇳🇴', r'norway', r'oslo', r'\.no\b', r'挪威', r'奥斯陆'],
+        'finland': [r'🇫🇮', r'finland', r'helsinki', r'\.fi\b', r'芬兰', r'赫尔辛基'],
+        'denmark': [r'🇩🇰', r'denmark', r'copenhagen', r'\.dk\b', r'丹麦', r'哥本哈根'],
+        'poland': [r'🇵🇱', r'poland', r'warsaw', r'\.pl\b', r'波兰', r'华沙'],
+        'ukraine': [r'🇺🇦', r'ukraine', r'kyiv', r'\.ua\b', r'乌克兰', r'基辅'],
+        'belarus': [r'🇧🇾', r'belarus', r'minsk', r'\.by\b', r'白俄罗斯', r'明斯克'],
+        'indonesia': [r'🇮🇩', r'indonesia', r'jakarta', r'\.id\b', r'印度尼西亚', r'雅加达'],
+        'malaysia': [r'🇲🇾', r'malaysia', r'kuala lumpur', r'\.my\b', r'马来西亚', r'吉隆坡'],
+        'philippines': [r'🇵🇭', r'philippines', r'manila', r'\.ph\b', r'菲律宾', r'马尼拉'],
+        'vietnam': [r'🇻🇳', r'vietnam', r'hanoi', r'\.vn\b', r'越南', r'河内'],
+        'thailand': [r'🇹🇭', r'thailand', r'bangkok', r'\.th\b', r'泰国', r'曼谷'],
+        'czech republic': [r'🇨🇿', r'czech', r'prague', r'\.cz\b', r'捷克', r'布拉格'],
+        'romania': [r'🇷🇴', r'romania', r'bucharest', r'\.ro\b', r'罗马尼亚', r'布加勒斯特'],
+        'hungary': [r'🇭🇺', r'hungary', r'budapest', r'\.hu\b', r'匈牙利', r'布达佩斯'],
+        'greece': [r'🇬🇷', r'greece', r'athens', r'\.gr\b', r'希腊', r'雅典'],
+        'bulgaria': [r'🇧🇬', r'bulgaria', r'sofia', r'\.bg\b', r'保加利亚', r'索非亚'],
+        'egypt': [r'🇪🇬', r'egypt', r'cairo', r'\.eg\b', r'埃及', r'开罗'],
+        'nigeria': [r'🇳🇬', r'nigeria', r'abuja', r'\.ng\b', r'尼日利亚', r'阿布贾'],
+        'kenya': [r'🇰🇪', r'kenya', r'nairobi', r'\.ke\b', r'肯尼亚', r'内罗毕'],
+        'colombia': [r'🇨🇴', r'colombia', r'bogota', r'\.co\b', r'哥伦比亚', r'波哥大'],
+        'peru': [r'🇵🇪', r'peru', r'lima', r'\.pe\b', r'秘鲁', r'利马'],
+        'chile': [r'🇨🇱', r'chile', r'santiago', r'\.cl\b', r'智利', r'圣地亚哥'],
+        'venezuela': [r'🇻🇪', r'venezuela', r'caracas', r'\.ve\b', r'委内瑞拉', r'加拉加斯'],
+        'austria': [r'🇦🇹', r'austria', r'vienna', r'\.at\b', r'奥地利', r'维也纳'],
+        'belgium': [r'🇧🇪', r'belgium', r'brussels', r'\.be\b', r'比利时', r'布鲁塞尔'],
+        'ireland': [r'🇮🇪', r'ireland', r'dublin', r'\.ie\b', r'爱尔兰', r'都柏林']
     }
     
     # Создаем список всех ключевых слов для целевой страны
