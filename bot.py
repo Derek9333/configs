@@ -12,7 +12,7 @@ import concurrent.futures
 from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     filters,
@@ -161,8 +161,7 @@ async def neural_detect_country(config: str) -> str:
         "Ответь только названием страны на английском в нижнем регистре или 'unknown', если не удалось определить."
     )
     try:
-        # Исправлено: добавлен await
-        response = await neural_client.chat.completions.create(
+        response = neural_client.chat.completions.create(
             model=NEURAL_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -520,19 +519,9 @@ def validate_config(config: str, target_country: str) -> tuple:
         if not validate_config_structure(config):
             return (config, False)
         if neural_client and len(config) < 500:
-            # Исправлено: правильно вызываем асинхронную функцию
-            import asyncio
-            try:
-                # Создаем новый event loop для вызова асинхронной функции
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                neural_country = loop.run_until_complete(neural_detect_country(config))
-                if neural_country and neural_country == target_country:
-                    return (config, True)
-            except Exception as e:
-                logger.error(f"Ошибка нейросети в validate_config: {e}")
-            finally:
-                loop.close()
+            neural_country = neural_detect_country(config)
+            if neural_country and neural_country == target_country:
+                return (config, True)
         return (config, False)
     except Exception as e:
         logger.error(f"Ошибка проверки конфига: {e}")
@@ -728,8 +717,7 @@ async def cancel(update: Update, context: CallbackContext):
     return ConversationHandler.END
 
 def main() -> None:
-    # Исправлено: создаем Application правильно
-    application = ApplicationBuilder().token(TOKEN).build()
+    application = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("check_configs", check_configs)],
