@@ -29,15 +29,16 @@ NEURAL_API_KEY = os.getenv("NEURAL_API_KEY")
 MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 МБ
 MAX_MSG_LENGTH = 4000
 GEOIP_API = "http://ip-api.com/json/"
-HEADERS = {'User-Agent': 'Telegram V2Ray Config Bot/2.0'}
-MAX_WORKERS = 8
+HEADERS = {'User-Agent': 'Telegram V2Ray Config Bot/3.0'}
+MAX_WORKERS = 10
 CHUNK_SIZE = 200
 MAX_CONFIGS_PER_USER = 10000
 NEURAL_MODEL = "deepseek/deepseek-r1-0528"
 CONFIG_CACHE_EXPIRY = 300  # 5 минут
+NEURAL_TIMEOUT = 15  # Таймаут для нейросети
 
 # Состояния диалога
-WAITING_FILE, WAITING_COUNTRY, WAITING_MODE, SENDING_CONFIGS = range(4)
+WAITING_FILE, WAITING_COUNTRY, WAITING_MODE, SENDING_CONFIGS, PROCESSING_STRICT = range(5)
 
 # Настройка логирования
 logging.basicConfig(
@@ -52,6 +53,7 @@ if NEURAL_API_KEY:
     neural_client = OpenAI(
         base_url="https://api.novita.ai/v3/openai",
         api_key=NEURAL_API_KEY,
+        timeout=NEURAL_TIMEOUT
     )
     logger.info("Нейросеть DeepSeek-R1 инициализирована")
 else:
@@ -304,12 +306,17 @@ async def button_handler(update: Update, context: CallbackContext) -> int:
     elif query.data == 'strict_mode':
         context.user_data['search_mode'] = 'strict'
         await query.edit_message_text("🔍 Запускаю строгий поиск...")
-        await process_search(update, context)
-        return SENDING_CONFIGS    
+        await strict_search(update, context)
+        return PROCESSING_STRICT    
         
     elif query.data == 'stop_sending':
         context.user_data['stop_sending'] = True
         await query.edit_message_text("⏹ Отправка конфигов остановлена.")
+        return ConversationHandler.END
+    
+    elif query.data == 'stop_strict_search':
+        context.user_data['stop_strict_search'] = True
+        await query.edit_message_text("⏹ Строгий поиск остановлен.")
         return ConversationHandler.END
     
     return context.user_data.get('current_state', WAITING_COUNTRY)
@@ -428,10 +435,10 @@ async def process_search(update: Update, context: CallbackContext):
     # Выбор режима поиска
     if search_mode == 'fast':
         await fast_search(update, context)
+        return SENDING_CONFIGS
     else:
         await strict_search(update, context)
-    
-    return SENDING_CONFIGS
+        return PROCESSING_STRICT
 
 async def fast_search(update: Update, context: CallbackContext):
     """Быстрый поиск конфигов"""
@@ -491,7 +498,7 @@ async def fast_search(update: Update, context: CallbackContext):
     await send_configs(update, context)
 
 async def strict_search(update: Update, context: CallbackContext):
-    """Строгий поиск конфигов с проверкой"""
+    """Строгий поиск конфигов с проверкой и отправкой по мере нахождения"""
     user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
     all_configs = context.user_data.get('all_configs', [])
     target_country = context.user_data.get('target_country', '')
@@ -510,7 +517,8 @@ async def strict_search(update: Update, context: CallbackContext):
             break
             
         try:
-            if is_config_relevant(config, target_country, context.user_data['country_codes']):
+            # Используем нейросеть для улучшения предварительной фильтрации
+            if is_config_relevant_with_neural(config, target_country, context.user_data['country_codes']):
                 prelim_configs.append(config)
         except Exception as e:
             logger.error(f"Ошибка быстрой проверки конфига #{i}: {e}")
@@ -535,39 +543,67 @@ async def strict_search(update: Update, context: CallbackContext):
     
     # Этап 2: строгая проверка
     total_chunks = (len(prelim_configs) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    # Создаем клавиатуру с кнопкой остановки
+    stop_keyboard = [[InlineKeyboardButton("⏹ Остановить строгий поиск", callback_data='stop_strict_search')]]
+    stop_reply_markup = InlineKeyboardMarkup(stop_keyboard)
+    
     await context.bot.edit_message_text(
         chat_id=user_id,
         message_id=progress_msg.message_id,
         text=f"🔍 Начинаю строгую проверку {len(prelim_configs)} конфигов секторами по {CHUNK_SIZE}...\n"
-        f"Всего секторов: {total_chunks}"
+        f"Всего секторов: {total_chunks}",
+        reply_markup=stop_reply_markup
     )
     
     start_time = time.time()
     strict_matched_configs = []
+    context.user_data['strict_in_progress'] = True  # Флаг, что строгий поиск в процессе
     
-    for chunk_idx in range(0, len(prelim_configs), CHUNK_SIZE):
-        if context.user_data.get('stop_sending'):
+    for chunk_idx in range(total_chunks):
+        if context.user_data.get('stop_sending') or context.user_data.get('stop_strict_search'):
             break
             
-        chunk = prelim_configs[chunk_idx:chunk_idx + CHUNK_SIZE]
+        start_idx = chunk_idx * CHUNK_SIZE
+        end_idx = min((chunk_idx+1) * CHUNK_SIZE, len(prelim_configs))
+        chunk = prelim_configs[start_idx:end_idx]
         chunk_start_time = time.time()
         
         # Параллельная проверка конфигов
         valid_configs = strict_config_check(chunk, target_country)
         strict_matched_configs.extend(valid_configs)
         
-        chunk_end_time = time.time()
-        chunk_time = chunk_end_time - chunk_start_time
+        # Сохраняем найденные конфиги для отправки
+        context.user_data['matched_configs'] = valid_configs
+        context.user_data['current_index'] = 0
+        context.user_data['country'] = context.user_data.get('country', '')
         
-        # Отчет о прогрессе
-        if chunk_idx + CHUNK_SIZE < len(prelim_configs):
+        # Отправляем найденные в этом чанке конфиги
+        if valid_configs:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"✅ Сектор {chunk_idx//CHUNK_SIZE + 1}/{total_chunks} обработан\n"
-                f"Найдено конфигов: {len(valid_configs)}\n"
-                f"Время обработки: {chunk_time:.1f} сек\n"
-                f"Всего найдено: {len(strict_matched_configs)}"
+                text=f"✅ В секторе {chunk_idx+1}/{total_chunks} найдено {len(valid_configs)} конфигов:"
             )
+            await send_configs(update, context)  # Отправляем пачками
+        else:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"ℹ️ В секторе {chunk_idx+1}/{total_chunks} конфигов не найдено."
+            )
+        
+        # Обновляем сообщение прогресса
+        chunk_time = time.time() - chunk_start_time
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=progress_msg.message_id,
+            text=f"🔍 Обработан сектор {chunk_idx+1}/{total_chunks}\n"
+                 f"Найдено конфигов: {len(valid_configs)}\n"
+                 f"Время обработки: {chunk_time:.1f} сек\n"
+                 f"Всего найдено: {len(strict_matched_configs)}",
+            reply_markup=stop_reply_markup
+        )
+    
+    # Убираем флаг
+    context.user_data['strict_in_progress'] = False
     
     total_time = time.time() - start_time
     logger.info(f"Строгая проверка завершена: найдено {len(strict_matched_configs)} конфигов, заняло {total_time:.2f} сек")
@@ -576,17 +612,17 @@ async def strict_search(update: Update, context: CallbackContext):
         await context.bot.send_message(chat_id=user_id, text=f"❌ Конфигурации для {context.user_data['country']} не найдены.")
         return ConversationHandler.END
     
-    # Отправка результатов
+    # Сохраняем все найденные конфиги для возможной повторной отправки
     context.user_data['matched_configs'] = strict_matched_configs
     context.user_data['current_index'] = 0
     context.user_data['stop_sending'] = False
     
     await context.bot.send_message(
         chat_id=user_id,
-        text=f"✅ Найдено {len(strict_matched_configs)} валидных конфигов для {context.user_data['country']}! Начинаю отправку..."
+        text=f"✅ Всего найдено {len(strict_matched_configs)} валидных конфигов для {context.user_data['country']}!"
     )
     
-    await send_configs(update, context)
+    return ConversationHandler.END
 
 async def send_configs(update: Update, context: CallbackContext):
     """Отправка конфигов пользователю"""
@@ -659,9 +695,22 @@ def is_config_relevant(config: str, target_country: str, country_codes: list) ->
         if tld in country_codes:
             return True
     
-    # Проверка структуры конфига
-    if validate_config_structure(config):
+    return False
+
+def is_config_relevant_with_neural(config: str, target_country: str, country_codes: list) -> bool:
+    """Проверка релевантности конфига с использованием нейросети"""
+    # Стандартные проверки
+    if is_config_relevant(config, target_country, country_codes):
         return True
+    
+    # Проверка с помощью нейросети (если включена и конфиг не слишком длинный)
+    if neural_client and len(config) < 500:
+        try:
+            neural_country = asyncio.run(neural_detect_country(config))
+            if neural_country and neural_country == target_country:
+                return True
+        except Exception as e:
+            logger.error(f"Ошибка нейросети при проверке конфига: {e}")
     
     return False
 
@@ -705,9 +754,12 @@ def validate_config(config: str, target_country: str) -> tuple:
         
         # Проверка нейросетью
         if neural_client and len(config) < 500:
-            neural_country = asyncio.run(neural_detect_country(config))
-            if neural_country and neural_country == target_country:
-                return (config, True)
+            try:
+                neural_country = asyncio.run(neural_detect_country(config))
+                if neural_country and neural_country == target_country:
+                    return (config, True)
+            except Exception as e:
+                logger.error(f"Ошибка нейросети при проверке конфига: {e}")
         
         return (config, False)
     except Exception as e:
@@ -903,6 +955,9 @@ def main() -> None:
                 CallbackQueryHandler(button_handler)
             ],
             SENDING_CONFIGS: [
+                CallbackQueryHandler(button_handler)
+            ],
+            PROCESSING_STRICT: [
                 CallbackQueryHandler(button_handler)
             ]
         },
