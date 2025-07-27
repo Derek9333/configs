@@ -3,3 +3,4 @@ pycountry
 requests
 cachetools
 openai
+python-telegram-bot[webhooks]
