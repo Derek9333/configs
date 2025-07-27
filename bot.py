@@ -11,14 +11,16 @@ import socket
 import concurrent.futures
 import spacy
 from urllib.parse import urlparse
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     filters,
     ContextTypes,
-    ConversationHandler
+    ConversationHandler,
+    CallbackQueryHandler,
+    CallbackContext
 )
 
 # Конфигурация
@@ -27,12 +29,12 @@ MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
 MAX_MSG_LENGTH = 4000  # Максимальная длина сообщения с запасом
 GEOIP_API = "http://ip-api.com/json/"
 HEADERS = {'User-Agent': 'Telegram V2Ray Config Bot/1.0'}
-STRICT_MODE = True  # Режим строгой проверки конфигов
 MAX_WORKERS = 5  # Максимальное количество потоков для проверки
 CHUNK_SIZE = 100  # Размер сектора для обработки конфигов
+MAX_CONFIGS_PER_USER = 5000  # Максимальное количество конфигов на пользователя
 
 # Состояния диалога
-WAITING_FILE, WAITING_COUNTRY = range(2)
+WAITING_FILE, WAITING_COUNTRY, WAITING_MODE, SENDING_CONFIGS = range(4)
 
 # Настройка логирования
 logging.basicConfig(
@@ -40,10 +42,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# Кэши
-geo_cache = {}
-dns_cache = {}
 
 # Глобальная переменная для модели Spacy
 nlp_model = None
@@ -83,7 +81,7 @@ def normalize_text(text: str) -> str:
         "индия": "india", "in": "india", "инд": "india",
         "южная корея": "south korea", "кр": "south korea", "sk": "south korea", 
         "корея": "south korea", "кор": "south korea",
-        "турция": "turkey", "tr": "turkey", "тур": "turkey",
+        "турция": "turkey", "tr": "turkey", " тур ": "turkey",
         "тайвань": "taiwan", "tw": "taiwan", "тайв": "taiwan",
         "юар": "south africa", "sa": "south africa", "африка": "south africa",
         "оаэ": "united arab emirates", "эмираты": "united arab emirates", 
@@ -134,6 +132,8 @@ def normalize_text(text: str) -> str:
 
 async def check_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Инициирует процесс проверки конфигов"""
+    # Очистка предыдущих данных
+    context.user_data.clear()
     await update.message.reply_text(
         "Пожалуйста, загрузите текстовый файл с конфигурациями V2RayTun."
     )
@@ -161,33 +161,100 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
         await file.download_to_memory(tmp_file)
         context.user_data['file_path'] = tmp_file.name
+        context.user_data['file_name'] = document.file_name
     
     logger.info(f"Пользователь {user.id} загрузил файл: {document.file_name} ({document.file_size} байт)")
+    
+    # Предложение загрузить еще файл или перейти к выбору страны
+    keyboard = [
+        [InlineKeyboardButton("📤 Загрузить еще файл", callback_data='add_file')],
+        [InlineKeyboardButton("🌍 Указать страну", callback_data='set_country')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
-        "✅ Файл получен. Теперь введите название страны (на русском или английском):"
+        f"✅ Файл '{document.file_name}' успешно загружен. Вы можете:",
+        reply_markup=reply_markup
     )
     return WAITING_COUNTRY
 
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает нажатия кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'add_file':
+        await query.edit_message_text("Пожалуйста, загрузите дополнительный файл с конфигурациями.")
+        return WAITING_FILE
+    
+    elif query.data == 'set_country':
+        await query.edit_message_text("Введите название страны (на русском или английском):")
+        return WAITING_COUNTRY
+    
+    elif query.data == 'fast_mode':
+        context.user_data['search_mode'] = 'fast'
+        await process_search(update, context)
+        return SENDING_CONFIGS
+    
+    elif query.data == 'strict_mode':
+        context.user_data['search_mode'] = 'strict'
+        await process_search(update, context)
+        return SENDING_CONFIGS
+    
+    elif query.data == 'stop_sending':
+        context.user_data['stop_sending'] = True
+        await query.edit_message_text("⏹ Отправка конфигов остановлена.")
+        return ConversationHandler.END
+    
+    return WAITING_COUNTRY
+
 async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает запрос страны и выдает результаты"""
-    user = update.message.from_user
+    """Обрабатывает запрос страны"""
     country_request = update.message.text
-    logger.info(f"Пользователь {user.id} запросил страну: {country_request}")
+    context.user_data['country_request'] = country_request
+    
+    # Предложение выбора режима поиска
+    keyboard = [
+        [
+            InlineKeyboardButton("⚡ Быстрый поиск", callback_data='fast_mode'),
+            InlineKeyboardButton("🔍 Строгий поиск", callback_data='strict_mode')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"Вы выбрали страну: {country_request}\nВыберите режим поиска:",
+        reply_markup=reply_markup
+    )
+    return WAITING_MODE
+
+async def process_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает поиск конфигов в выбранном режиме"""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        user_id = query.from_user.id
+    else:
+        user_id = update.message.from_user.id
+    
+    country_request = context.user_data.get('country_request', '')
+    search_mode = context.user_data.get('search_mode', 'fast')
+    
+    if not country_request:
+        await context.bot.send_message(chat_id=user_id, text="❌ Ошибка: страна не указана.")
+        return ConversationHandler.END
+    
+    logger.info(f"Пользователь {user_id} запросил страну: {country_request} в режиме {search_mode}")
     
     normalized_text = normalize_text(country_request)
     logger.info(f"Нормализованный текст: {normalized_text}")
-    
-    country = None
-    aliases = []
-    country_codes = []
-    target_country = None
     
     try:
         # Попытка определить страну через pycountry
         countries = pycountry.countries.search_fuzzy(normalized_text)
         country = countries[0]
         target_country = country.name.lower()
-        logger.info(f"Определена страна через pycountry: {country.name} (целевое название: {target_country})")
+        logger.info(f"Определена страна: {country.name} (целевое название: {target_country})")
         
         # Получаем альтернативные названия и коды стран
         aliases = get_country_aliases(target_country)
@@ -195,7 +262,7 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         logger.info(f"Альтернативы страны: {aliases}, коды: {country_codes}")
     except LookupError:
-        logger.warning(f"Страна не распознана pycountry: {country_request}")
+        logger.warning(f"Страна не распознана: {country_request}")
         # Попытка извлечь страну через NER
         nlp = load_spacy_model()
         if nlp:
@@ -223,11 +290,9 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
                     if len(unique_countries) == 1:
                         country_name = unique_countries[0]
-                        logger.info(f"Одна страна найдена через NER: {country_name}")
                     else:
                         # Если несколько стран, выбираем первую
                         country_name = unique_countries[0]
-                        logger.info(f"Несколько стран найдено через NER, выбрана: {country_name}")
                     
                     # Получаем объект страны
                     country = pycountry.countries.search_fuzzy(country_name)[0]
@@ -235,56 +300,149 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     aliases = get_country_aliases(target_country)
                     country_codes = [country.alpha_2.lower()]
                     logger.info(f"Страна определена через NER: {country.name}")
-                    
-                    await update.message.reply_text(
-                        f"🌍 Страна определена через контекст: {country.name}"
-                    )
                 else:
                     logger.warning("Не удалось определить страну через NER")
-                    await update.message.reply_text("❌ Страна не распознана. Пожалуйста, уточните название.")
+                    await context.bot.send_message(chat_id=user_id, text="❌ Страна не распознана. Пожалуйста, уточните название.")
                     return ConversationHandler.END
             except Exception as e:
                 logger.error(f"Ошибка NER: {e}")
-                await update.message.reply_text("❌ Ошибка обработки запроса. Попробуйте еще раз.")
+                await context.bot.send_message(chat_id=user_id, text="❌ Ошибка обработки запроса. Попробуйте еще раз.")
                 return ConversationHandler.END
         else:
-            await update.message.reply_text("❌ Ошибка обработки запроса. Попробуйте еще раз.")
+            await context.bot.send_message(chat_id=user_id, text="❌ Ошибка обработки запроса. Попробуйте еще раз.")
             return ConversationHandler.END
     
-    # Чтение и обработка файла
-    file_path = context.user_data.get('file_path')
-    if not file_path or not os.path.exists(file_path):
-        logger.error("Путь к файлу не найден или файл отсутствует")
-        await update.message.reply_text("❌ Ошибка: файл конфигурации не найден.")
-        return ConversationHandler.END
+    # Сохраняем данные о стране для использования
+    context.user_data['country'] = country.name
+    context.user_data['target_country'] = target_country
+    context.user_data['aliases'] = aliases
+    context.user_data['country_codes'] = country_codes
     
-    try:
-        start_time = time.time()
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            configs = f.read().splitlines()
-        logger.info(f"Файл прочитан: {len(configs)} строк, за {time.time()-start_time:.2f} сек")
-    except Exception as e:
-        logger.error(f"Ошибка чтения файла: {e}")
-        await update.message.reply_text("❌ Ошибка обработки файла. Проверьте формат.")
-        return ConversationHandler.END
-    finally:
-        # Удаление временного файла
+    # Чтение и обработка файлов
+    file_paths = context.user_data.get('file_paths', [])
+    if not file_paths:
+        # Если файлов еще нет, используем текущий
         if 'file_path' in context.user_data:
-            file_path = context.user_data['file_path']
-            if os.path.exists(file_path):
-                os.unlink(file_path)
-            del context.user_data['file_path']
+            file_paths = [context.user_data['file_path']]
+            context.user_data['file_paths'] = file_paths
     
-    # Поиск релевантных конфигов - этап 1: быстрая фильтрация
+    if not file_paths:
+        logger.error("Пути к файлам не найдены")
+        await context.bot.send_message(chat_id=user_id, text="❌ Ошибка: файлы конфигурации не найдены.")
+        return ConversationHandler.END
+    
+    # Чтение всех файлов
+    all_configs = []
+    for file_path in file_paths:
+        try:
+            await context.bot.send_message(chat_id=user_id, text="⏳ Идет чтение файла...")
+            start_time = time.time()
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                configs = f.read().splitlines()
+            logger.info(f"Файл прочитан: {len(configs)} строк, за {time.time()-start_time:.2f} сек")
+            all_configs.extend(configs)
+        except Exception as e:
+            logger.error(f"Ошибка чтения файла: {e}")
+            await context.bot.send_message(chat_id=user_id, text=f"❌ Ошибка обработки файла: {e}")
+    
+    if not all_configs:
+        await context.bot.send_message(chat_id=user_id, text="❌ В файлах не найдено конфигураций.")
+        return ConversationHandler.END
+    
+    # Ограничение количества конфигов
+    if len(all_configs) > MAX_CONFIGS_PER_USER:
+        all_configs = all_configs[:MAX_CONFIGS_PER_USER]
+        await context.bot.send_message(
+            chat_id=user_id, 
+            text=f"⚠️ Внимание: обрабатывается только первые {MAX_CONFIGS_PER_USER} конфигов из-за ограничений."
+        )
+    
+    context.user_data['all_configs'] = all_configs
+    
+    # Быстрый поиск
+    if search_mode == 'fast':
+        await context.bot.send_message(chat_id=user_id, text="🔎 Начинаю быстрый поиск конфигов...")
+        await fast_search(update, context)
+    # Строгий поиск
+    else:
+        await context.bot.send_message(chat_id=user_id, text="🔍 Начинаю строгий поиск конфигов...")
+        await strict_search(update, context)
+    
+    return SENDING_CONFIGS
+
+async def fast_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполняет быстрый поиск конфигов"""
+    user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
+    all_configs = context.user_data.get('all_configs', [])
+    target_country = context.user_data.get('target_country', '')
+    aliases = context.user_data.get('aliases', [])
+    country_codes = context.user_data.get('country_codes', [])
+    
+    if not all_configs or not target_country:
+        await context.bot.send_message(chat_id=user_id, text="❌ Ошибка: данные для поиска отсутствуют.")
+        return ConversationHandler.END
+    
+    # Поиск релевантных конфигов
+    start_time = time.time()
+    matched_configs = []
+    
+    # Получаем флаг страны для поиска в конфигах
+    flag_pattern = get_country_flag_pattern(context.user_data['country'])
+    
+    for i, config in enumerate(all_configs):
+        if not config.strip():
+            continue
+        
+        try:
+            # Проверка по ключевым словам и доменным зонам
+            if is_config_relevant(config, target_country, aliases, country_codes, flag_pattern):
+                matched_configs.append(config)
+        except Exception as e:
+            logger.error(f"Ошибка проверки конфига #{i}: {e}")
+            continue
+        
+        # Логируем прогресс каждые 1000 конфигов
+        if i % 1000 == 0 and i > 0:
+            logger.info(f"Обработано {i}/{len(all_configs)} конфигов...")
+    
+    logger.info(f"Найдено {len(matched_configs)} конфигов для {context.user_data['country']}, обработка заняла {time.time()-start_time:.2f} сек")
+    
+    if not matched_configs:
+        await context.bot.send_message(chat_id=user_id, text=f"❌ Конфигурации для {context.user_data['country']} не найдены.")
+        return ConversationHandler.END
+    
+    context.user_data['matched_configs'] = matched_configs
+    context.user_data['current_index'] = 0
+    context.user_data['stop_sending'] = False
+    
+    # Начинаем отправку конфигов
+    await send_configs(update, context)
+
+async def strict_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выполняет строгий поиск конфигов"""
+    user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
+    all_configs = context.user_data.get('all_configs', [])
+    target_country = context.user_data.get('target_country', '')
+    
+    if not all_configs or not target_country:
+        await context.bot.send_message(chat_id=user_id, text="❌ Ошибка: данные для поиска отсутствуют.")
+        return ConversationHandler.END
+    
+    # Предварительная фильтрация
+    await context.bot.send_message(chat_id=user_id, text="🔎 Этап 1: предварительная фильтрация конфигов...")
     start_time = time.time()
     prelim_configs = []
-    for i, config in enumerate(configs):
+    
+    # Получаем флаг страны для поиска в конфигах
+    flag_pattern = get_country_flag_pattern(context.user_data['country'])
+    
+    for i, config in enumerate(all_configs):
         if not config.strip():
             continue
         
         try:
             # Быстрая проверка по ключевым словам и доменным зонам
-            if is_config_relevant(config, target_country, aliases, country_codes):
+            if is_config_relevant(config, target_country, context.user_data['aliases'], context.user_data['country_codes'], flag_pattern):
                 prelim_configs.append(config)
         except Exception as e:
             logger.error(f"Ошибка быстрой проверки конфига #{i}: {e}")
@@ -292,101 +450,151 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Логируем прогресс каждые 1000 конфигов
         if i % 1000 == 0 and i > 0:
-            logger.info(f"Обработано {i}/{len(configs)} конфигов...")
+            logger.info(f"Обработано {i}/{len(all_configs)} конфигов...")
     
-    logger.info(f"Предварительно найдено {len(prelim_configs)} конфигов для {country.name}, обработка заняла {time.time()-start_time:.2f} сек")
+    logger.info(f"Предварительно найдено {len(prelim_configs)} конфигов для {context.user_data['country']}, обработка заняла {time.time()-start_time:.2f} сек")
     
-    # Строгая проверка конфигов - этап 2 (секторами)
+    if not prelim_configs:
+        await context.bot.send_message(chat_id=user_id, text=f"❌ Конфигурации для {context.user_data['country']} не найдены.")
+        return ConversationHandler.END
+    
+    # Строгая проверка конфигов
+    total_chunks = (len(prelim_configs) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"🔍 Начинаю строгую проверку {len(prelim_configs)} конфигов секторами по {CHUNK_SIZE}...\n"
+        f"Всего секторов: {total_chunks}"
+    )
+    
+    start_time = time.time()
     strict_matched_configs = []
-    if STRICT_MODE and prelim_configs:
-        total_chunks = (len(prelim_configs) + CHUNK_SIZE - 1) // CHUNK_SIZE
-        await update.message.reply_text(
-            f"🔍 Начинаю строгую проверку {len(prelim_configs)} конфигов секторами по {CHUNK_SIZE}...\n"
-            f"Всего секторов: {total_chunks}"
-        )
+    
+    for chunk_idx in range(0, len(prelim_configs), CHUNK_SIZE):
+        if context.user_data.get('stop_sending'):
+            break
+            
+        chunk = prelim_configs[chunk_idx:chunk_idx + CHUNK_SIZE]
+        chunk_start_time = time.time()
         
-        start_time = time.time()
-        for chunk_idx in range(0, len(prelim_configs), CHUNK_SIZE):
-            chunk = prelim_configs[chunk_idx:chunk_idx + CHUNK_SIZE]
-            chunk_start_time = time.time()
-            
-            # Проверяем текущий сектор
-            valid_configs = strict_config_check(chunk, target_country)
-            strict_matched_configs.extend(valid_configs)
-            
-            # Отправляем промежуточные результаты
-            chunk_end_time = time.time()
-            chunk_time = chunk_end_time - chunk_start_time
-            await update.message.reply_text(
-                f"✅ Сектор {chunk_idx//CHUNK_SIZE + 1}/{total_chunks} обработан\n"
+        # Проверяем текущий сектор
+        valid_configs = strict_config_check(chunk, target_country)
+        strict_matched_configs.extend(valid_configs)
+        
+        # Отправляем промежуточные результаты
+        chunk_end_time = time.time()
+        chunk_time = chunk_end_time - chunk_start_time
+        
+        if chunk_idx + CHUNK_SIZE < len(prelim_configs):
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ Сектор {chunk_idx//CHUNK_SIZE + 1}/{total_chunks} обработан\n"
                 f"Найдено конфигов: {len(valid_configs)}\n"
                 f"Время обработки: {chunk_time:.1f} сек\n"
                 f"Всего найдено: {len(strict_matched_configs)}"
             )
-            
-            # Отправляем сами конфиги, если они есть
-            if valid_configs:
-                await send_configs(update, valid_configs, country.name)
         
-        total_time = time.time() - start_time
-        logger.info(f"Строгая проверка завершена: найдено {len(strict_matched_configs)} конфигов, заняло {total_time:.2f} сек")
+        # Отправляем сами конфиги, если они есть
+        if valid_configs:
+            context.user_data['matched_configs'] = valid_configs
+            context.user_data['current_index'] = 0
+            await send_configs(update, context)
     
-    matched_configs = strict_matched_configs if STRICT_MODE else prelim_configs
+    total_time = time.time() - start_time
+    logger.info(f"Строгая проверка завершена: найдено {len(strict_matched_configs)} конфигов, заняло {total_time:.2f} сек")
     
-    # Отправка результатов
-    if not matched_configs:
-        await update.message.reply_text(f"❌ Конфигурации для {country.name} не найдены.")
+    if not strict_matched_configs:
+        await context.bot.send_message(chat_id=user_id, text=f"❌ Конфигурации для {context.user_data['country']} не найдены.")
         return ConversationHandler.END
     
-    # Отправляем все оставшиеся конфиги (если не в строгом режиме)
-    if not STRICT_MODE:
-        await send_configs(update, matched_configs, country.name)
-    
-    logger.info(f"Всего отправлено {len(matched_configs)} конфигов для {country.name}")
-    await update.message.reply_text(f"✅ Готово! Всего найдено {len(matched_configs)} конфигов для {country.name}.")
-    return ConversationHandler.END
+    # Отправляем все оставшиеся конфиги
+    context.user_data['matched_configs'] = strict_matched_configs
+    context.user_data['current_index'] = 0
+    context.user_data['stop_sending'] = False
+    await send_configs(update, context)
 
-async def send_configs(update: Update, configs: list, country_name: str):
+async def send_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправляет конфиги пользователю с разбивкой на сообщения"""
-    header = f"Конфиги для {country_name}:\n"
-    current_message = header
+    user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
+    matched_configs = context.user_data.get('matched_configs', [])
+    current_index = context.user_data.get('current_index', 0)
+    country_name = context.user_data.get('country', '')
+    stop_sending = context.user_data.get('stop_sending', False)
     
-    for i, config in enumerate(configs):
-        config_line = f"{config}\n"
+    if not matched_configs or current_index >= len(matched_configs) or stop_sending:
+        if not stop_sending and current_index < len(matched_configs):
+            await context.bot.send_message(chat_id=user_id, text="✅ Все конфиги отправлены.")
+        return ConversationHandler.END
+    
+    # Кнопка остановки
+    stop_button = [[InlineKeyboardButton("⏹ Остановить отправку", callback_data='stop_sending')]]
+    reply_markup = InlineKeyboardMarkup(stop_button)
+    
+    # Формируем сообщение
+    header = f"Конфиги для {country_name}:\n\n"
+    message = header
+    sent_count = 0
+    
+    # Получаем флаг страны для добавления к конфигам
+    flag = get_country_flag(context.user_data['country'])
+    
+    while current_index < len(matched_configs):
+        config = matched_configs[current_index]
+        config_line = f"{flag} {config}\n\n" if flag else f"{config}\n\n"
         
-        if len(current_message) + len(config_line) > MAX_MSG_LENGTH:
-            try:
-                await update.message.reply_text(f"<pre>{current_message}</pre>", parse_mode='HTML')
-                current_message = header + config_line
-            except Exception as e:
-                logger.error(f"Ошибка отправки сообщения: {e}")
-                current_message = header + config_line
-        else:
-            current_message += config_line
+        # Проверяем, не превысит ли добавление новой строки лимит
+        if len(message) + len(config_line) > MAX_MSG_LENGTH:
+            break
+            
+        message += config_line
+        current_index += 1
+        sent_count += 1
+        
+        # Ограничиваем количество конфигов в одном сообщении
+        if sent_count >= 20:
+            break
     
-    if len(current_message) > len(header):
-        try:
-            await update.message.reply_text(f"<pre>{current_message}</pre>", parse_mode='HTML')
-        except Exception as e:
-            logger.error(f"Ошибка отправки финального сообщения: {e}")
+    # Отправляем сообщение
+    try:
+        if message.strip() != header.strip():
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"<pre>{message}</pre>",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        logger.error(f"Ошибка отправки сообщения: {e}")
+    
+    # Сохраняем текущую позицию
+    context.user_data['current_index'] = current_index
+    
+    # Если еще есть конфиги для отправки, планируем следующее сообщение
+    if current_index < len(matched_configs) and not context.user_data.get('stop_sending', False):
+        # Даем небольшую паузу между сообщениями
+        time.sleep(1)
+        await send_configs(update, context)
+    else:
+        if current_index >= len(matched_configs):
+            await context.bot.send_message(chat_id=user_id, text="✅ Все конфиги отправлены.")
+        return ConversationHandler.END
 
-def is_config_relevant(config: str, target_country: str, aliases: list, country_codes: list) -> bool:
+def is_config_relevant(config: str, target_country: str, aliases: list, country_codes: list, flag_pattern: str = None) -> bool:
     """Быстрая проверка конфига на релевантность стране"""
-    # 1. Проверка по ключевым словам
+    # 1. Проверка по флагу (если указан)
+    if flag_pattern and re.search(flag_pattern, config, re.IGNORECASE):
+        return True
+    
+    # 2. Проверка по ключевым словам
     if detect_by_keywords(config, target_country, aliases):
         return True
     
-    # 2. Проверка по доменной зоне
+    # 3. Проверка по доменной зоне
     domain = extract_domain(config)
     if domain:
         tld = domain.split('.')[-1].lower()
         if tld in country_codes:
             return True
     
-    # 3. Проверка по геолокации в кэше
-    if config in geo_cache and geo_cache[config] == target_country:
-        return True
-        
     return False
 
 def strict_config_check(configs: list, target_country: str) -> list:
@@ -399,7 +607,7 @@ def strict_config_check(configs: list, target_country: str) -> list:
         for config in configs:
             futures.append(executor.submit(validate_config, config, target_country))
         
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+        for future in concurrent.futures.as_completed(futures):
             config, is_valid = future.result()
             if is_valid:
                 valid_configs.append(config)
@@ -414,7 +622,7 @@ def validate_config(config: str, target_country: str) -> tuple:
         if not host:
             return (config, False)
         
-        # Проверка DNS (кэширование запросов)
+        # Проверка DNS
         ip = resolve_dns(host)
         if not ip:
             return (config, False)
@@ -458,28 +666,19 @@ def validate_config_structure(config: str) -> bool:
     return bool(re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b', config))
 
 def resolve_dns(host: str) -> str:
-    """Разрешает доменное имя в IP-адрес с кэшированием"""
-    if host in dns_cache:
-        return dns_cache[host]
-    
+    """Разрешает доменное имя в IP-адрес"""
     try:
         # Пропускаем IP-адреса
         if re.match(r'\d+\.\d+\.\d+\.\d+', host):
-            dns_cache[host] = host
             return host
         
         # Разрешение DNS
-        ip = socket.gethostbyname(host)
-        dns_cache[host] = ip
-        return ip
+        return socket.gethostbyname(host)
     except:
         return None
 
 def geolocate_ip(ip: str) -> str:
-    """Определяет страну по IP с кэшированием"""
-    if ip in geo_cache:
-        return geo_cache[ip]
-    
+    """Определяет страну по IP"""
     try:
         # Пропускаем локальные адреса
         if re.match(r'(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)', ip):
@@ -488,9 +687,7 @@ def geolocate_ip(ip: str) -> str:
         response = requests.get(f"{GEOIP_API}{ip}", headers=HEADERS, timeout=5)
         data = response.json()
         if data.get('status') == 'success':
-            country = data.get('country')
-            geo_cache[ip] = country
-            return country
+            return data.get('country')
     except Exception as e:
         logger.error(f"Ошибка геолокации для {ip}: {e}")
     
@@ -547,55 +744,114 @@ def get_country_aliases(country_name: str) -> list:
     }
     return aliases.get(country_name.lower(), [])
 
+def get_country_flag(country_name: str) -> str:
+    """Возвращает флаг страны для вставки в конфиг"""
+    flag_map = {
+        "united states": "🇺🇸",
+        "russia": "🇷🇺",
+        "germany": "🇩🇪",
+        "united kingdom": "🇬🇧",
+        "france": "🇫🇷",
+        "japan": "🇯🇵",
+        "brazil": "🇧🇷",
+        "south korea": "🇰🇷",
+        "turkey": "🇹🇷",
+        "taiwan": "🇹🇼",
+        "switzerland": "🇨🇭",
+        "china": "🇨🇳",
+        "india": "🇮🇳",
+        "canada": "🇨🇦",
+        "australia": "🇦🇺",
+        "singapore": "🇸🇬",
+        "italy": "🇮🇹",
+        "spain": "🇪🇸",
+        "portugal": "🇵🇹",
+        "norway": "🇳🇴",
+        "finland": "🇫🇮",
+        "denmark": "🇩🇰",
+        "poland": "🇵🇱",
+        "ukraine": "🇺🇦",
+        "belarus": "🇧🇾",
+        "indonesia": "🇮🇩",
+        "malaysia": "🇲🇾",
+        "philippines": "🇵🇭",
+        "vietnam": "🇻🇳",
+        "thailand": "🇹🇭",
+        "czech republic": "🇨🇿",
+        "romania": "🇷🇴",
+        "hungary": "🇭🇺",
+        "greece": "🇬🇷",
+        "bulgaria": "🇧🇬",
+        "egypt": "🇪🇬",
+        "nigeria": "🇳🇬",
+        "kenya": "🇰🇪",
+        "colombia": "🇨🇴",
+        "peru": "🇵🇪",
+        "chile": "🇨🇱",
+        "venezuela": "🇻🇪",
+        "austria": "🇦🇹",
+        "belgium": "🇧🇪",
+        "ireland": "🇮🇪"
+    }
+    return flag_map.get(country_name.lower(), "")
+
+def get_country_flag_pattern(country_name: str) -> str:
+    """Возвращает регулярное выражение для поиска флага страны"""
+    flag = get_country_flag(country_name)
+    if flag:
+        # Экранируем специальные символы в флаге
+        return re.escape(flag)
+    return ""
+
 def detect_by_keywords(config: str, target_country: str, aliases: list) -> bool:
     """Определение страны по ключевым словам в конфиге"""
     # Словарь паттернов (регулярные выражения с приоритетами)
     patterns = {
-        'japan': [r'🇯🇵', r'\bjp\b', r'japan', r'tokyo', r'\.jp\b', r'日本', r'東京'],
-        'united states': [r'🇺🇸', r'\bus\b', r'usa\b', r'united states', r'new york', r'\.us\b', r'美国', r'紐約'],
-        'russia': [r'🇷🇺', r'\bru\b', r'russia', r'moscow', r'\.ru\b', r'россия', r'俄国', r'москва'],
-        'germany': [r'🇩🇪', r'\bde\b', r'germany', r'frankfurt', r'\.de\b', r'германия', r'德国', r'フランクフルト'],
-        'united kingdom': [r'🇬🇧', r'\buk\b', r'united kingdom', r'london', r'\.uk\b', r'英国', r'倫敦', r'gb'],
-        'france': [r'🇫🇷', r'france', r'paris', r'\.fr\b', r'法国', r'巴黎'],
-        'brazil': [r'🇧🇷', r'brazil', r'sao paulo', r'\.br\b', r'巴西', r'聖保羅'],
-        'singapore': [r'🇸🇬', r'singapore', r'\.sg\b', r'新加坡', r'星加坡'],
-        'south korea': [r'🇰🇷', r'korea', r'seoul', r'\.kr\b', r'韩国', r'首爾', r'korean'],
-        'turkey': [r'🇹🇷', r'turkey', r'istanbul', r'\.tr\b', r'土耳其', r'伊斯坦布爾'],
-        'taiwan': [r'🇹🇼', r'taiwan', r'taipei', r'\.tw\b', r'台湾', r'台北'],
-        'switzerland': [r'🇨🇭', r'switzerland', r'zurich', r'\.ch\b', r'瑞士', r'蘇黎世'],
-        'india': [r'🇮🇳', r'india', r'mumbai', r'\.in\b', r'印度', r'孟買'],
-        'canada': [r'🇨🇦', r'canada', r'toronto', r'\.ca\b', r'加拿大', r'多倫多'],
-        'australia': [r'🇦🇺', r'australia', r'sydney', r'\.au\b', r'澳洲', r'悉尼'],
-        'china': [r'🇨🇳', r'china', r'beijing', r'\.cn\b', r'中国', r'北京'],
-        'italy': [r'🇮🇹', r'italy', r'rome', r'\.it\b', r'意大利', r'羅馬'],
-        'spain': [r'🇪🇸', r'spain', r'madrid', r'\.es\b', r'西班牙', r'马德里'],
-        'portugal': [r'🇵🇹', r'portugal', r'lisbon', r'\.pt\b', r'葡萄牙', r'里斯本'],
-        'norway': [r'🇳🇴', r'norway', r'oslo', r'\.no\b', r'挪威', r'奥斯陆'],
-        'finland': [r'🇫🇮', r'finland', r'helsinki', r'\.fi\b', r'芬兰', r'赫尔辛基'],
-        'denmark': [r'🇩🇰', r'denmark', r'copenhagen', r'\.dk\b', r'丹麦', r'哥本哈根'],
-        'poland': [r'🇵🇱', r'poland', r'warsaw', r'\.pl\b', r'波兰', r'华沙'],
-        'ukraine': [r'🇺🇦', r'ukraine', r'kyiv', r'\.ua\b', r'乌克兰', r'基辅'],
-        'belarus': [r'🇧🇾', r'belarus', r'minsk', r'\.by\b', r'白俄罗斯', r'明斯克'],
-        'indonesia': [r'🇮🇩', r'indonesia', r'jakarta', r'\.id\b', r'印度尼西亚', r'雅加达'],
-        'malaysia': [r'🇲🇾', r'malaysia', r'kuala lumpur', r'\.my\b', r'马来西亚', r'吉隆坡'],
-        'philippines': [r'🇵🇭', r'philippines', r'manila', r'\.ph\b', r'菲律宾', r'马尼拉'],
-        'vietnam': [r'🇻🇳', r'vietnam', r'hanoi', r'\.vn\b', r'越南', r'河内'],
-        'thailand': [r'🇹🇭', r'thailand', r'bangkok', r'\.th\b', r'泰国', r'曼谷'],
-        'czech republic': [r'🇨🇿', r'czech', r'prague', r'\.cz\b', r'捷克', r'布拉格'],
-        'romania': [r'🇷🇴', r'romania', r'bucharest', r'\.ro\b', r'罗马尼亚', r'布加勒斯特'],
-        'hungary': [r'🇭🇺', r'hungary', r'budapest', r'\.hu\b', r'匈牙利', r'布达佩斯'],
-        'greece': [r'🇬🇷', r'greece', r'athens', r'\.gr\b', r'希腊', r'雅典'],
-        'bulgaria': [r'🇧🇬', r'bulgaria', r'sofia', r'\.bg\b', r'保加利亚', r'索非亚'],
-        'egypt': [r'🇪🇬', r'egypt', r'cairo', r'\.eg\b', r'埃及', r'开罗'],
-        'nigeria': [r'🇳🇬', r'nigeria', r'abuja', r'\.ng\b', r'尼日利亚', r'阿布贾'],
-        'kenya': [r'🇰🇪', r'kenya', r'nairobi', r'\.ke\b', r'肯尼亚', r'内罗毕'],
-        'colombia': [r'🇨🇴', r'colombia', r'bogota', r'\.co\b', r'哥伦比亚', r'波哥大'],
-        'peru': [r'🇵🇪', r'peru', r'lima', r'\.pe\b', r'秘鲁', r'利马'],
-        'chile': [r'🇨🇱', r'chile', r'santiago', r'\.cl\b', r'智利', r'圣地亚哥'],
-        'venezuela': [r'🇻🇪', r'venezuela', r'caracas', r'\.ve\b', r'委内瑞拉', r'加拉加斯'],
-        'austria': [r'🇦🇹', r'austria', r'vienna', r'\.at\b', r'奥地利', r'维也纳'],
-        'belgium': [r'🇧🇪', r'belgium', r'brussels', r'\.be\b', r'比利时', r'布鲁塞尔'],
-        'ireland': [r'🇮🇪', r'ireland', r'dublin', r'\.ie\b', r'爱尔兰', r'都柏林']
+        'japan': [r'jp\b', r'japan', r'tokyo', r'\.jp\b', r'日本', r'東京'],
+        'united states': [r'us\b', r'usa\b', r'united states', r'new york', r'\.us\b', r'美国', r'紐約'],
+        'russia': [r'ru\b', r'russia', r'moscow', r'\.ru\b', r'россия', r'俄国', r'москва'],
+        'germany': [r'de\b', r'germany', r'frankfurt', r'\.de\b', r'германия', r'德国', r'フランクフルト'],
+        'united kingdom': [r'uk\b', r'united kingdom', r'london', r'\.uk\b', r'英国', r'倫敦', r'gb'],
+        'france': [r'france', r'paris', r'\.fr\b', r'法国', r'巴黎'],
+        'brazil': [r'brazil', r'sao paulo', r'\.br\b', r'巴西', r'聖保羅'],
+        'singapore': [r'singapore', r'\.sg\b', r'新加坡', r'星加坡'],
+        'south korea': [r'korea', r'seoul', r'\.kr\b', r'韩国', r'首爾', r'korean'],
+        'turkey': [r'turkey', r'istanbul', r'\.tr\b', r'土耳其', r'伊斯坦布爾'],
+        'taiwan': [r'taiwan', r'taipei', r'\.tw\b', r'台湾', r'台北'],
+        'switzerland': [r'switzerland', r'zurich', r'\.ch\b', r'瑞士', r'蘇黎世'],
+        'india': [r'india', r'mumbai', r'\.in\b', r'印度', r'孟買'],
+        'canada': [r'canada', r'toronto', r'\.ca\b', r'加拿大', r'多倫多'],
+        'australia': [r'australia', r'sydney', r'\.au\b', r'澳洲', r'悉尼'],
+        'china': [r'china', r'beijing', r'\.cn\b', r'中国', r'北京'],
+        'italy': [r'italy', r'rome', r'\.it\b', r'意大利', r'羅馬'],
+        'spain': [r'spain', r'madrid', r'\.es\b', r'西班牙', r'马德里'],
+        'portugal': [r'portugal', r'lisbon', r'\.pt\b', r'葡萄牙', r'里斯本'],
+        'norway': [r'norway', r'oslo', r'\.no\b', r'挪威', r'奥斯陆'],
+        'finland': [r'finland', r'helsinki', r'\.fi\b', r'芬兰', r'赫尔辛基'],
+        'denmark': [r'denmark', r'copenhagen', r'\.dk\b', r'丹麦', r'哥本哈根'],
+        'poland': [r'poland', r'warsaw', r'\.pl\b', r'波兰', r'华沙'],
+        'ukraine': [r'ukraine', r'kyiv', r'\.ua\b', r'乌克兰', r'基辅'],
+        'belarus': [r'belarus', r'minsk', r'\.by\b', r'白俄罗斯', r'明斯克'],
+        'indonesia': [r'indonesia', r'jakarta', r'\.id\b', r'印度尼西亚', r'雅加达'],
+        'malaysia': [r'malaysia', r'kuala lumpur', r'\.my\b', r'马来西亚', r'吉隆坡'],
+        'philippines': [r'philippines', r'manila', r'\.ph\b', r'菲律宾', r'马尼拉'],
+        'vietnam': [r'vietnam', r'hanoi', r'\.vn\b', r'越南', r'河内'],
+        'thailand': [r'thailand', r'bangkok', r'\.th\b', r'泰国', r'曼谷'],
+        'czech republic': [r'czech', r'prague', r'\.cz\b', r'捷克', r'布拉格'],
+        'romania': [r'romania', r'bucharest', r'\.ro\b', r'罗马尼亚', r'布加勒斯特'],
+        'hungary': [r'hungary', r'budapest', r'\.hu\b', r'匈牙利', r'布达佩斯'],
+        'greece': [r'greece', r'athens', r'\.gr\b', r'希腊', r'雅典'],
+        'bulgaria': [r'bulgaria', r'sofia', r'\.bg\b', r'保加利亚', r'索非亚'],
+        'egypt': [r'egypt', r'cairo', r'\.eg\b', r'埃及', r'开罗'],
+        'nigeria': [r'nigeria', r'abuja', r'\.ng\b', r'尼日利亚', r'阿布贾'],
+        'kenya': [r'kenya', r'nairobi', r'\.ke\b', r'肯尼亚', r'内罗毕'],
+        'colombia': [r'colombia', r'bogota', r'\.co\b', r'哥伦比亚', r'波哥大'],
+        'peru': [r'peru', r'lima', r'\.pe\b', r'秘鲁', r'利马'],
+        'chile': [r'chile', r'santiago', r'\.cl\b', r'智利', r'圣地亚哥'],
+        'venezuela': [r'venezuela', r'caracas', r'\.ve\b', r'委内瑞拉', r'加拉加斯'],
+        'austria': [r'austria', r'vienna', r'\.at\b', r'奥地利', r'维也纳'],
+        'belgium': [r'belgium', r'brussels', r'\.be\b', r'比利时', r'布鲁塞尔'],
+        'ireland': [r'ireland', r'dublin', r'\.ie\b', r'爱尔兰', r'都柏林']
     }
     
     # Создаем список всех ключевых слов для целевой страны
@@ -662,12 +918,19 @@ def extract_domain(config: str) -> str:
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отменяет текущий диалог"""
-    if 'file_path' in context.user_data:
-        file_path = context.user_data['file_path']
-        if os.path.exists(file_path):
-            os.unlink(file_path)
-        del context.user_data['file_path']
+    # Очищаем временные файлы
+    for key in ['file_path', 'file_paths']:
+        if key in context.user_data:
+            file_paths = context.user_data[key]
+            if not isinstance(file_paths, list):
+                file_paths = [file_paths]
+                
+            for file_path in file_paths:
+                if os.path.exists(file_path):
+                    os.unlink(file_path)
+            del context.user_data[key]
     
+    context.user_data.clear()
     await update.message.reply_text("Операция отменена.")
     return ConversationHandler.END
 
@@ -684,11 +947,19 @@ def main() -> None:
                               lambda u, c: u.message.reply_text("❌ Пожалуйста, загрузите текстовый файл."))
             ],
             WAITING_COUNTRY: [
+                CallbackQueryHandler(button_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_country)
+            ],
+            WAITING_MODE: [
+                CallbackQueryHandler(button_handler)
+            ],
+            SENDING_CONFIGS: [
+                CallbackQueryHandler(button_handler)
             ]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True
+        allow_reentry=True,
+        per_user=True
     )
     
     application.add_handler(conv_handler)
