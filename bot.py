@@ -955,8 +955,13 @@ async def cancel(update: Update, context: CallbackContext):
 
 def main() -> None:
     """Запуск бота"""
-    # Создаем приложение с использованием токена
-    application = Application.builder().token(TOKEN).build()
+    # Используем ApplicationBuilder с явным указанием параметров
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .updater(None)  # Явно отключаем создание Updater
+        .build()
+    )
     
     # Создаем обработчик диалога
     conv_handler = ConversationHandler(
@@ -1000,9 +1005,6 @@ def main() -> None:
             listen="0.0.0.0",
             port=port,
             webhook_url=webhook_url,
-            url_path="webhook",
-            key="private.key",
-            cert="cert.pem",
             drop_pending_updates=True
         )
     else:
