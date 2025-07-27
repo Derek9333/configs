@@ -9,7 +9,6 @@ import requests
 import time
 import socket
 import concurrent.futures
-import spacy
 from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -19,8 +18,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
     ConversationHandler,
-    CallbackQueryHandler,
-    CallbackContext
+    CallbackQueryHandler
 )
 
 # Конфигурация
@@ -42,20 +40,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# Глобальная переменная для модели Spacy
-nlp_model = None
-
-def load_spacy_model():
-    """Загружает модель Spacy для NER при первом использовании"""
-    global nlp_model
-    if nlp_model is None:
-        try:
-            nlp_model = spacy.load("en_core_web_sm")
-            logger.info("Модель Spacy успешно загружена")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки модели Spacy: {e}")
-    return nlp_model
 
 def normalize_text(text: str) -> str:
     """Нормализует текст, заменяя названия стран на английские эквиваленты"""
@@ -263,54 +247,8 @@ async def process_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Альтернативы страны: {aliases}, коды: {country_codes}")
     except LookupError:
         logger.warning(f"Страна не распознана: {country_request}")
-        # Попытка извлечь страну через NER
-        nlp = load_spacy_model()
-        if nlp:
-            try:
-                doc = nlp(normalized_text)
-                logger.info(f"Извлеченные сущности: {[(ent.text, ent.label_) for ent in doc.ents]}")
-                
-                found_countries = []
-                for ent in doc.ents:
-                    if ent.label_ in ['GPE', 'COUNTRY']:
-                        try:
-                            # Ищем страну по названию сущности
-                            countries_list = pycountry.countries.search_fuzzy(ent.text)
-                            if countries_list:
-                                country_obj = countries_list[0]
-                                found_countries.append(country_obj.name)
-                                logger.info(f"Найдена страна через NER: {ent.text} -> {country_obj.name}")
-                        except LookupError:
-                            continue
-                
-                if found_countries:
-                    # Убираем дубликаты, сохраняя порядок
-                    seen = set()
-                    unique_countries = [c for c in found_countries if c not in seen and not seen.add(c)]
-                    
-                    if len(unique_countries) == 1:
-                        country_name = unique_countries[0]
-                    else:
-                        # Если несколько стран, выбираем первую
-                        country_name = unique_countries[0]
-                    
-                    # Получаем объект страны
-                    country = pycountry.countries.search_fuzzy(country_name)[0]
-                    target_country = country.name.lower()
-                    aliases = get_country_aliases(target_country)
-                    country_codes = [country.alpha_2.lower()]
-                    logger.info(f"Страна определена через NER: {country.name}")
-                else:
-                    logger.warning("Не удалось определить страну через NER")
-                    await context.bot.send_message(chat_id=user_id, text="❌ Страна не распознана. Пожалуйста, уточните название.")
-                    return ConversationHandler.END
-            except Exception as e:
-                logger.error(f"Ошибка NER: {e}")
-                await context.bot.send_message(chat_id=user_id, text="❌ Ошибка обработки запроса. Попробуйте еще раз.")
-                return ConversationHandler.END
-        else:
-            await context.bot.send_message(chat_id=user_id, text="❌ Ошибка обработки запроса. Попробуйте еще раз.")
-            return ConversationHandler.END
+        await context.bot.send_message(chat_id=user_id, text="❌ Страна не распознана. Пожалуйста, уточните название.")
+        return ConversationHandler.END
     
     # Сохраняем данные о стране для использования
     context.user_data['country'] = country.name
