@@ -12,13 +12,14 @@ import concurrent.futures
 from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
+    Updater,
     CommandHandler,
     MessageHandler,
-    filters,
-    ContextTypes,
+    Filters,
+    CallbackContext,
     ConversationHandler,
-    CallbackQueryHandler
+    CallbackQueryHandler,
+    JobQueue
 )
 
 # Конфигурация
@@ -114,7 +115,7 @@ def normalize_text(text: str) -> str:
     
     return text
 
-async def check_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def check_configs(update: Update, context: CallbackContext):
     """Инициирует процесс проверки конфигов"""
     # Очистка предыдущих данных
     context.user_data.clear()
@@ -123,7 +124,7 @@ async def check_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return WAITING_FILE
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_document(update: Update, context: CallbackContext):
     """Обрабатывает загруженный файл"""
     user = update.message.from_user
     document = update.message.document
@@ -162,7 +163,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return WAITING_COUNTRY
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def button_handler(update: Update, context: CallbackContext) -> int:
     """Обрабатывает нажатия кнопок"""
     query = update.callback_query
     await query.answer()
@@ -192,7 +193,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     return WAITING_COUNTRY
 
-async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_country(update: Update, context: CallbackContext):
     """Обрабатывает запрос страны"""
     country_request = update.message.text
     context.user_data['country_request'] = country_request
@@ -212,7 +213,7 @@ async def handle_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return WAITING_MODE
 
-async def process_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def process_search(update: Update, context: CallbackContext):
     """Обрабатывает поиск конфигов в выбранном режиме"""
     query = update.callback_query
     if query:
@@ -308,7 +309,7 @@ async def process_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return SENDING_CONFIGS
 
-async def fast_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def fast_search(update: Update, context: CallbackContext):
     """Выполняет быстрый поиск конфигов"""
     user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
     all_configs = context.user_data.get('all_configs', [])
@@ -356,7 +357,7 @@ async def fast_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Начинаем отправку конфигов
     await send_configs(update, context)
 
-async def strict_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def strict_search(update: Update, context: CallbackContext):
     """Выполняет строгий поиск конфигов"""
     user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
     all_configs = context.user_data.get('all_configs', [])
@@ -450,7 +451,7 @@ async def strict_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['stop_sending'] = False
     await send_configs(update, context)
 
-async def send_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_configs(update: Update, context: CallbackContext):
     """Отправляет конфиги пользователю с разбивкой на сообщения"""
     user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
     matched_configs = context.user_data.get('matched_configs', [])
@@ -854,7 +855,7 @@ def extract_domain(config: str) -> str:
     
     return None
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel(update: Update, context: CallbackContext):
     """Отменяет текущий диалог"""
     # Очищаем временные файлы
     for key in ['file_path', 'file_paths']:
@@ -874,19 +875,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main() -> None:
     """Запуск бота"""
-    application = Application.builder().token(TOKEN).build()
+    # Исправление для совместимости с Python 3.10
+    job_queue = JobQueue()
+    updater = Updater(TOKEN, use_context=True)
+    application = updater.dispatcher
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("check_configs", check_configs)],
         states={
             WAITING_FILE: [
-                MessageHandler(filters.Document.TEXT, handle_document),
-                MessageHandler(filters.ALL & ~filters.COMMAND, 
+                MessageHandler(Filters.document.text, handle_document),
+                MessageHandler(Filters.all & ~Filters.command, 
                               lambda u, c: u.message.reply_text("❌ Пожалуйста, загрузите текстовый файл."))
             ],
             WAITING_COUNTRY: [
                 CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_country)
+                MessageHandler(Filters.text & ~Filters.command, handle_country)
             ],
             WAITING_MODE: [
                 CallbackQueryHandler(button_handler)
@@ -910,7 +914,7 @@ def main() -> None:
         # Режим вебхуков для Render.com
         webhook_url = f"https://{external_host}/webhook"
         logger.info(f"Запуск в режиме webhook: {webhook_url}")
-        application.run_webhook(
+        updater.start_webhook(
             listen="0.0.0.0",
             port=port,
             webhook_url=webhook_url,
@@ -919,7 +923,13 @@ def main() -> None:
     else:
         # Режим polling для локальной разработки
         logger.info("Запуск в режиме polling")
-        application.run_polling()
+        updater.start_polling()
+    
+    # Устанавливаем JobQueue
+    job_queue.set_dispatcher(application)
+    job_queue.start()
+    
+    updater.idle()
 
 if __name__ == "__main__":
     main()
