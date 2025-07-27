@@ -519,9 +519,18 @@ def validate_config(config: str, target_country: str) -> tuple:
         if not validate_config_structure(config):
             return (config, False)
         if neural_client and len(config) < 500:
-            neural_country = neural_detect_country(config)
-            if neural_country and neural_country == target_country:
-                return (config, True)
+            # Создаем новый event loop для асинхронного вызова
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                neural_country = loop.run_until_complete(neural_detect_country(config))
+                if neural_country and neural_country == target_country:
+                    return (config, True)
+            except Exception as e:
+                logger.error(f"Ошибка нейросети при проверке конфига: {e}")
+            finally:
+                loop.close()
         return (config, False)
     except Exception as e:
         logger.error(f"Ошибка проверки конфига: {e}")
@@ -717,7 +726,16 @@ async def cancel(update: Update, context: CallbackContext):
     return ConversationHandler.END
 
 def main() -> None:
-    application = Application.builder().token(TOKEN).build()
+    # Исправление: создаем приложение с явным указанием update_queue
+    from telegram.ext._updater import Updater
+    from telegram.ext import ApplicationBuilder
+    
+    application = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .updater(Updater(bot=None, update_queue=None))
+        .build()
+    )
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("check_configs", check_configs)],
