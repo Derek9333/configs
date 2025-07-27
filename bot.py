@@ -12,18 +12,19 @@ import concurrent.futures
 from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Updater,
+    Application,
     CommandHandler,
     MessageHandler,
-    Filters,
+    filters,
     CallbackContext,
     ConversationHandler,
-    CallbackQueryHandler,
-    JobQueue
+    CallbackQueryHandler
 )
+from openai import OpenAI
 
 # Конфигурация
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+NEURAL_API_KEY = os.getenv("NEURAL_API_KEY")  # Ключ для нейросети
 MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB
 MAX_MSG_LENGTH = 4000  # Максимальная длина сообщения с запасом
 GEOIP_API = "http://ip-api.com/json/"
@@ -31,6 +32,7 @@ HEADERS = {'User-Agent': 'Telegram V2Ray Config Bot/1.0'}
 MAX_WORKERS = 5  # Максимальное количество потоков для проверки
 CHUNK_SIZE = 100  # Размер сектора для обработки конфигов
 MAX_CONFIGS_PER_USER = 5000  # Максимальное количество конфигов на пользователя
+NEURAL_MODEL = "deepseek/deepseek-r1-0528"
 
 # Состояния диалога
 WAITING_FILE, WAITING_COUNTRY, WAITING_MODE, SENDING_CONFIGS = range(4)
@@ -41,6 +43,17 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Инициализация нейросети
+neural_client = None
+if NEURAL_API_KEY:
+    neural_client = OpenAI(
+        base_url="https://api.novita.ai/v3/openai",
+        api_key=NEURAL_API_KEY,
+    )
+    logger.info("Нейросеть DeepSeek-R1 инициализирована")
+else:
+    logger.warning("NEURAL_API_KEY не установлен, функции нейросети отключены")
 
 def normalize_text(text: str) -> str:
     """Нормализует текст, заменяя названия стран на английские эквиваленты"""
@@ -66,7 +79,7 @@ def normalize_text(text: str) -> str:
         "индия": "india", "in": "india", "инд": "india",
         "южная корея": "south korea", "кр": "south korea", "sk": "south korea", 
         "корея": "south korea", "кор": "south korea",
-        "турция": "turkey", "tr": "turkey", " тур ": "turkey",
+        " турция": "turkey", "tr": "turkey", " тур ": "turkey",
         "тайвань": "taiwan", "tw": "taiwan", "тайв": "taiwan",
         "юар": "south africa", "sa": "south africa", "африка": "south africa",
         "оаэ": "united arab emirates", "эмираты": "united arab emirates", 
@@ -114,6 +127,75 @@ def normalize_text(text: str) -> str:
         text = text.replace(key, ru_en_map[key])
     
     return text
+
+async def neural_normalize_country(text: str) -> str:
+    """Использует нейросеть для нормализации названия страны"""
+    if not neural_client:
+        return None
+        
+    system_prompt = (
+        "Ты эксперт по географии. Пользователь вводит название страны. "
+        "Определи, какая страна имеется в виду, и верни её каноническое английское название в нижнем регистре. "
+        "Примеры: 'рф' → 'russia', 'соединенные штаты' → 'united states'. "
+        "Если не уверен, верни None."
+    )
+    
+    try:
+        response = neural_client.chat.completions.create(
+            model=NEURAL_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            max_tokens=50,
+            temperature=0.1
+        )
+        result = response.choices[0].message.content.strip().lower()
+        
+        # Проверим, что результат похож на название страны
+        if result and len(result) < 50:  # Ограничим длину
+            # Попробуем найти страну через pycountry
+            try:
+                country = pycountry.countries.search_fuzzy(result)[0]
+                return country.name.lower()
+            except:
+                # Если не нашли, вернем результат нейросети
+                return result
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка нейросети: {e}")
+        return None
+
+async def neural_detect_country(config: str) -> str:
+    """Использует нейросеть для определения страны из конфига V2Ray"""
+    if not neural_client:
+        return None
+
+    system_prompt = (
+        "Ты эксперт по V2Ray конфигурациям. Определи, для какой страны предназначен этот конфиг. "
+        "Ответь только названием страны на английском в нижнем регистре или 'unknown', если не удалось определить."
+    )
+
+    try:
+        response = neural_client.chat.completions.create(
+            model=NEURAL_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": config}
+            ],
+            max_tokens=20,
+            temperature=0.1
+        )
+        result = response.choices[0].message.content.strip().lower()
+        # Очистим результат: оставим только буквы и пробелы
+        result = re.sub(r'[^a-z\s]', '', result)
+        # Уберем слово 'unknown'
+        if 'unknown' in result:
+            return None
+        return result
+    except Exception as e:
+        logger.error(f"Ошибка нейросети при определении страны конфига: {e}")
+        return None
 
 async def check_configs(update: Update, context: CallbackContext):
     """Инициирует процесс проверки конфигов"""
@@ -198,6 +280,38 @@ async def handle_country(update: Update, context: CallbackContext):
     country_request = update.message.text
     context.user_data['country_request'] = country_request
     
+    # Нормализация текста
+    normalized_text = normalize_text(country_request)
+    logger.info(f"Нормализованный текст: {normalized_text}")
+    
+    country = None
+    try:
+        # Попытка определить страну через pycountry
+        countries = pycountry.countries.search_fuzzy(normalized_text)
+        country = countries[0]
+        logger.info(f"Pycountry определил страну: {country.name}")
+    except LookupError:
+        # Если pycountry не смог, используем нейросеть
+        logger.info("Pycountry не смог определить страну. Пробуем нейросеть...")
+        neural_country = await neural_normalize_country(normalized_text)
+        if neural_country:
+            try:
+                countries = pycountry.countries.search_fuzzy(neural_country)
+                country = countries[0]
+                logger.info(f"Нейросеть определила страну: {country.name}")
+            except:
+                logger.warning("Нейросеть не смогла определить страну")
+    
+    if not country:
+        logger.warning(f"Страна не распознана: {country_request}")
+        await update.message.reply_text("❌ Страна не распознана. Пожалуйста, уточните название.")
+        return WAITING_COUNTRY
+    
+    # Сохраняем данные о стране
+    context.user_data['country'] = country.name
+    context.user_data['target_country'] = country.name.lower()
+    context.user_data['country_codes'] = [c.alpha_2.lower() for c in countries] + [country.alpha_2.lower()]
+    
     # Предложение выбора режима поиска
     keyboard = [
         [
@@ -208,7 +322,7 @@ async def handle_country(update: Update, context: CallbackContext):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"Вы выбрали страну: {country_request}\nВыберите режим поиска:",
+        f"Вы выбрали страну: {country.name}\nВыберите режим поиска:",
         reply_markup=reply_markup
     )
     return WAITING_MODE
@@ -230,32 +344,6 @@ async def process_search(update: Update, context: CallbackContext):
         return ConversationHandler.END
     
     logger.info(f"Пользователь {user_id} запросил страну: {country_request} в режиме {search_mode}")
-    
-    normalized_text = normalize_text(country_request)
-    logger.info(f"Нормализованный текст: {normalized_text}")
-    
-    try:
-        # Попытка определить страну через pycountry
-        countries = pycountry.countries.search_fuzzy(normalized_text)
-        country = countries[0]
-        target_country = country.name.lower()
-        logger.info(f"Определена страна: {country.name} (целевое название: {target_country})")
-        
-        # Получаем альтернативные названия и коды стран
-        aliases = get_country_aliases(target_country)
-        country_codes = [c.alpha_2.lower() for c in countries] + [country.alpha_2.lower()]
-        
-        logger.info(f"Альтернативы страны: {aliases}, коды: {country_codes}")
-    except LookupError:
-        logger.warning(f"Страна не распознана: {country_request}")
-        await context.bot.send_message(chat_id=user_id, text="❌ Страна не распознана. Пожалуйста, уточните название.")
-        return ConversationHandler.END
-    
-    # Сохраняем данные о стране для использования
-    context.user_data['country'] = country.name
-    context.user_data['target_country'] = target_country
-    context.user_data['aliases'] = aliases
-    context.user_data['country_codes'] = country_codes
     
     # Чтение и обработка файлов
     file_paths = context.user_data.get('file_paths', [])
@@ -314,8 +402,6 @@ async def fast_search(update: Update, context: CallbackContext):
     user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
     all_configs = context.user_data.get('all_configs', [])
     target_country = context.user_data.get('target_country', '')
-    aliases = context.user_data.get('aliases', [])
-    country_codes = context.user_data.get('country_codes', [])
     
     if not all_configs or not target_country:
         await context.bot.send_message(chat_id=user_id, text="❌ Ошибка: данные для поиска отсутствуют.")
@@ -334,7 +420,7 @@ async def fast_search(update: Update, context: CallbackContext):
         
         try:
             # Проверка по ключевым словам и доменным зонам
-            if is_config_relevant(config, target_country, aliases, country_codes, flag_pattern):
+            if is_config_relevant(config, target_country, context.user_data['country_codes'], flag_pattern):
                 matched_configs.append(config)
         except Exception as e:
             logger.error(f"Ошибка проверки конфига #{i}: {e}")
@@ -381,7 +467,7 @@ async def strict_search(update: Update, context: CallbackContext):
         
         try:
             # Быстрая проверка по ключевым словам и доменным зонам
-            if is_config_relevant(config, target_country, context.user_data['aliases'], context.user_data['country_codes'], flag_pattern):
+            if is_config_relevant(config, target_country, context.user_data['country_codes'], flag_pattern):
                 prelim_configs.append(config)
         except Exception as e:
             logger.error(f"Ошибка быстрой проверки конфига #{i}: {e}")
@@ -517,14 +603,14 @@ async def send_configs(update: Update, context: CallbackContext):
             await context.bot.send_message(chat_id=user_id, text="✅ Все конфиги отправлены.")
         return ConversationHandler.END
 
-def is_config_relevant(config: str, target_country: str, aliases: list, country_codes: list, flag_pattern: str = None) -> bool:
+def is_config_relevant(config: str, target_country: str, country_codes: list, flag_pattern: str = None) -> bool:
     """Быстрая проверка конфига на релевантность стране"""
     # 1. Проверка по флагу (если указан)
     if flag_pattern and re.search(flag_pattern, config, re.IGNORECASE):
         return True
     
     # 2. Проверка по ключевым словам
-    if detect_by_keywords(config, target_country, aliases):
+    if detect_by_keywords(config, target_country):
         return True
     
     # 3. Проверка по доменной зоне
@@ -568,14 +654,20 @@ def validate_config(config: str, target_country: str) -> tuple:
         
         # Геолокация IP
         country = geolocate_ip(ip)
-        if not country or country.lower() != target_country:
-            return (config, False)
+        if country and country.lower() == target_country:
+            return (config, True)
         
         # Дополнительная проверка структуры конфига
         if not validate_config_structure(config):
             return (config, False)
             
-        return (config, True)
+        # Используем нейросеть для сложных случаев
+        if neural_client and len(config) < 500:
+            neural_country = neural_detect_country(config)
+            if neural_country and neural_country == target_country:
+                return (config, True)
+            
+        return (config, False)
     except Exception as e:
         logger.error(f"Ошибка проверки конфига: {e}")
         return (config, False)
@@ -742,7 +834,7 @@ def get_country_flag_pattern(country_name: str) -> str:
         return re.escape(flag)
     return ""
 
-def detect_by_keywords(config: str, target_country: str, aliases: list) -> bool:
+def detect_by_keywords(config: str, target_country: str) -> bool:
     """Определение страны по ключевым словам в конфиге"""
     # Словарь паттернов (регулярные выражения с приоритетами)
     patterns = {
@@ -780,7 +872,7 @@ def detect_by_keywords(config: str, target_country: str, aliases: list) -> bool:
         'romania': [r'romania', r'bucharest', r'\.ro\b', r'罗马尼亚', r'布加勒斯特'],
         'hungary': [r'hungary', r'budapest', r'\.hu\b', r'匈牙利', r'布达佩斯'],
         'greece': [r'greece', r'athens', r'\.gr\b', r'希腊', r'雅典'],
-        'bulgaria': [r'bulgaria', r'sofia', r'\.bg\b', r'保加利亚', r'索非亚'],
+        'bulgaria': [r'bulgaria', r'sofia', r'\.bg\b', r'保加利亚', r'索非а'],
         'egypt': [r'egypt', r'cairo', r'\.eg\b', r'埃及', r'开罗'],
         'nigeria': [r'nigeria', r'abuja', r'\.ng\b', r'尼日利亚', r'阿布贾'],
         'kenya': [r'kenya', r'nairobi', r'\.ke\b', r'肯尼亚', r'内罗毕'],
@@ -793,23 +885,11 @@ def detect_by_keywords(config: str, target_country: str, aliases: list) -> bool:
         'ireland': [r'ireland', r'dublin', r'\.ie\b', r'爱尔兰', r'都柏林']
     }
     
-    # Создаем список всех ключевых слов для целевой страны
-    target_keywords = []
+    # Проверяем наличие ключевых слов для целевой страны
     if target_country in patterns:
-        target_keywords = patterns[target_country]
-    
-    # Добавляем альтернативные названия
-    for alias in aliases:
-        if alias in patterns:
-            target_keywords.extend(patterns[alias])
-    
-    # Удаляем дубликаты
-    target_keywords = list(set(target_keywords))
-    
-    # Проверяем наличие ключевых слов
-    for pattern in target_keywords:
-        if re.search(pattern, config, re.IGNORECASE):
-            return True
+        for pattern in patterns[target_country]:
+            if re.search(pattern, config, re.IGNORECASE):
+                return True
     
     return False
 
@@ -875,22 +955,21 @@ async def cancel(update: Update, context: CallbackContext):
 
 def main() -> None:
     """Запуск бота"""
-    # Исправление для совместимости с Python 3.10
-    job_queue = JobQueue()
-    updater = Updater(TOKEN, use_context=True)
-    application = updater.dispatcher
+    # Создаем приложение с использованием токена
+    application = Application.builder().token(TOKEN).build()
     
+    # Создаем обработчик диалога
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("check_configs", check_configs)],
         states={
             WAITING_FILE: [
-                MessageHandler(Filters.document.text, handle_document),
-                MessageHandler(Filters.all & ~Filters.command, 
-                              lambda u, c: u.message.reply_text("❌ Пожалуйста, загрузите текстовый файл."))
+                MessageHandler(filters.Document.TEXT, handle_document),
+                MessageHandler(filters.ALL & ~filters.COMMAND, 
+                              lambda update, context: update.message.reply_text("❌ Пожалуйста, загрузите текстовый файл."))
             ],
             WAITING_COUNTRY: [
                 CallbackQueryHandler(button_handler),
-                MessageHandler(Filters.text & ~Filters.command, handle_country)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_country)
             ],
             WAITING_MODE: [
                 CallbackQueryHandler(button_handler)
@@ -904,6 +983,7 @@ def main() -> None:
         per_user=True
     )
     
+    # Добавляем обработчик в приложение
     application.add_handler(conv_handler)
     
     # Настройка веб-сервера для Render.com
@@ -914,22 +994,21 @@ def main() -> None:
         # Режим вебхуков для Render.com
         webhook_url = f"https://{external_host}/webhook"
         logger.info(f"Запуск в режиме webhook: {webhook_url}")
-        updater.start_webhook(
+        
+        # Настройка вебхука
+        application.run_webhook(
             listen="0.0.0.0",
             port=port,
             webhook_url=webhook_url,
-            url_path="webhook"
+            url_path="webhook",
+            key="private.key",
+            cert="cert.pem",
+            drop_pending_updates=True
         )
     else:
         # Режим polling для локальной разработки
         logger.info("Запуск в режиме polling")
-        updater.start_polling()
-    
-    # Устанавливаем JobQueue
-    job_queue.set_dispatcher(application)
-    job_queue.start()
-    
-    updater.idle()
+        application.run_polling()
 
 if __name__ == "__main__":
     main()
