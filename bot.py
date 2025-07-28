@@ -32,12 +32,12 @@ MAX_MSG_LENGTH = 4000
 GEOIP_API = "http://ip-api.com/json/"
 HEADERS = {'User-Agent': 'Telegram V2Ray Config Bot/3.0'}
 MAX_WORKERS = 10
-CHUNK_SIZE = 200
+CHUNK_SIZE = 500  # Увеличен размер чанка
 NEURAL_MODEL = "deepseek/deepseek-r1-0528"
 NEURAL_TIMEOUT = 15  # Таймаут для нейросети
 
 # Состояния диалога
-WAITING_FILE, WAITING_COUNTRY, WAITING_MODE, WAITING_NUMBER, SENDING_CONFIGS, PROCESSING_STRICT = range(6)
+START, WAITING_FILE, WAITING_COUNTRY, WAITING_MODE, WAITING_NUMBER, SENDING_CONFIGS, PROCESSING_STRICT = range(7)
 
 # Настройка логирования
 logging.basicConfig(
@@ -66,6 +66,18 @@ config_cache = {}
 instruction_cache = {}
 country_normalization_cache = {}
 neural_improvement_cache = {}
+
+def clear_temporary_data(context: CallbackContext):
+    """Очистка временных данных в user_data"""
+    keys_to_clear = [
+        'matched_configs', 'current_index', 'stop_sending', 
+        'strict_in_progress', 'improved_search', 'country_request', 
+        'country', 'target_country', 'country_codes', 'search_mode',
+        'all_configs', 'file_path', 'file_paths'
+    ]
+    for key in keys_to_clear:
+        if key in context.user_data:
+            del context.user_data[key]
 
 def normalize_text(text: str) -> str:
     """Нормализация текста страны для поиска"""
@@ -278,13 +290,28 @@ async def neural_improve_search(country: str) -> dict:
         logger.error(f"Ошибка улучшения поиска: {e}")
         return None
 
-async def check_configs(update: Update, context: CallbackContext):
-    """Обработчик команды /check_configs"""
-    context.user_data.clear()
-    await update.message.reply_text(
-        "📎 Пожалуйста, загрузите текстовый файл с конфигурациями V2Ray (до 15 МБ)."
-    )
-    return WAITING_FILE
+async def start_check(update: Update, context: CallbackContext):
+    """Начало проверки конфигов с выбором действия"""
+    clear_temporary_data(context)
+    user_id = update.message.from_user.id
+    
+    # Проверяем наличие истории
+    if 'configs' in context.user_data and context.user_data['configs'] and 'last_country' in context.user_data:
+        keyboard = [
+            [InlineKeyboardButton("🌍 Использовать текущий файл", callback_data='use_current_file')],
+            [InlineKeyboardButton("📤 Загрузить новый файл", callback_data='new_file')],
+            [InlineKeyboardButton("❌ Отменить", callback_data='cancel')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "У вас уже есть загруженный файл конфигов. Хотите использовать его или загрузить новый?",
+            reply_markup=reply_markup
+        )
+        return START
+    else:
+        await update.message.reply_text("📎 Пожалуйста, загрузите текстовый файл с конфигурациями V2Ray (до 15 МБ).")
+        return WAITING_FILE
 
 async def handle_document(update: Update, context: CallbackContext):
     """Обработка загруженного файла"""
@@ -307,10 +334,19 @@ async def handle_document(update: Update, context: CallbackContext):
     file = await context.bot.get_file(document.file_id)
     with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
         await file.download_to_memory(tmp_file)
-        context.user_data['file_path'] = tmp_file.name
+        tmp_file.seek(0)
+        content = tmp_file.read().decode('utf-8', errors='replace')
+        lines = content.splitlines()
+        configs = [line.strip() for line in lines if line.strip()]
+        context.user_data['configs'] = configs
         context.user_data['file_name'] = document.file_name
+        tmp_file_path = tmp_file.name
     
-    logger.info(f"Пользователь {user.id} загрузил файл: {document.file_name} ({document.file_size} байт)")
+    # Удаление временного файла
+    if os.path.exists(tmp_file_path):
+        os.unlink(tmp_file_path)
+    
+    logger.info(f"Пользователь {user.id} загрузил файл: {document.file_name} ({len(configs)} конфигов)")
     
     # Клавиатура действий
     keyboard = [
@@ -320,7 +356,7 @@ async def handle_document(update: Update, context: CallbackContext):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"✅ Файл '{document.file_name}' успешно загружен. Вы можете:",
+        f"✅ Файл '{document.file_name}' успешно загружен ({len(configs)} конфигов). Вы можете:",
         reply_markup=reply_markup
     )
     return WAITING_COUNTRY
@@ -337,6 +373,14 @@ async def button_handler(update: Update, context: CallbackContext) -> int:
     elif query.data == 'set_country':
         await query.edit_message_text("🌍 Введите название страны (на русском или английском):")
         return WAITING_COUNTRY
+    
+    elif query.data == 'use_current_file':
+        await query.edit_message_text("🌍 Введите название страны (на русском или английском):")
+        return WAITING_COUNTRY
+    
+    elif query.data == 'new_file':
+        await query.edit_message_text("📎 Пожалуйста, загрузите текстовый файл с конфигурациями.")
+        return WAITING_FILE
     
     elif query.data == 'fast_mode':
         context.user_data['search_mode'] = 'fast'
@@ -361,6 +405,10 @@ async def button_handler(update: Update, context: CallbackContext) -> int:
         return ConversationHandler.END
     
     return context.user_data.get('current_state', WAITING_COUNTRY)
+
+async def start_choice(update: Update, context: CallbackContext) -> int:
+    """Обработка выбора действия в начале"""
+    return await button_handler(update, context)
 
 async def handle_country(update: Update, context: CallbackContext):
     """Обработка ввода страны"""
@@ -458,46 +506,20 @@ async def process_search(update: Update, context: CallbackContext):
     
     logger.info(f"Пользователь {user_id} запросил страну: {country_name} в режиме {search_mode}")
     
-    # Получение путей к файлам
-    file_paths = context.user_data.get('file_paths', [])
-    if not file_paths and 'file_path' in context.user_data:
-        file_paths = [context.user_data['file_path']]
-        context.user_data['file_paths'] = file_paths
-    
-    if not file_paths:
-        logger.error("Пути к файлам не найдены")
-        await context.bot.send_message(chat_id=user_id, text="❌ Ошибка: файлы конфигурации не найдены.")
-        return ConversationHandler.END
-    
-    # Чтение конфигов из файлов
-    all_configs = []
-    total_lines = 0
-    
-    for file_path in file_paths:
-        try:
-            start_time = time.time()
-            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        all_configs.append(line)
-                        total_lines += 1
-            logger.info(f"Файл прочитан: {len(all_configs)} конфигов, за {time.time()-start_time:.2f} сек")
-        except Exception as e:
-            logger.error(f"Ошибка чтения файла: {e}")
-            await context.bot.send_message(chat_id=user_id, text=f"❌ Ошибка обработки файла: {e}")
-    
-    if not all_configs:
-        await context.bot.send_message(chat_id=user_id, text="❌ В файлах не найдено конфигураций.")
+    # Получение конфигов
+    configs = context.user_data.get('configs', [])
+    if not configs:
+        logger.error("Конфиги не найдены")
+        await context.bot.send_message(chat_id=user_id, text="❌ Ошибка: конфигурации не найдены.")
         return ConversationHandler.END
     
     # Уведомление о количестве конфигов
     await context.bot.send_message(
         chat_id=user_id, 
-        text=f"ℹ️ Обрабатывается {len(all_configs)} конфигов..."
+        text=f"ℹ️ Обрабатывается {len(configs)} конфигов..."
     )
     
-    context.user_data['all_configs'] = all_configs
+    context.user_data['all_configs'] = configs
     
     # Выбор режима поиска
     if search_mode == 'fast':
@@ -602,8 +624,8 @@ async def strict_search(update: Update, context: CallbackContext):
     
     for i, config in enumerate(all_configs):
         try:
-            # Используем нейросеть для улучшения предварительной фильтрации
-            if is_config_relevant_with_neural(
+            # Используем быструю проверку без нейросети для предварительной фильтрации
+            if is_config_relevant(
                 config, 
                 target_country, 
                 context.user_data['country_codes'],
@@ -750,6 +772,10 @@ async def send_configs(update: Update, context: CallbackContext):
     if not matched_configs or current_index >= len(matched_configs) or stop_sending:
         if not stop_sending and current_index < len(matched_configs):
             await context.bot.send_message(chat_id=user_id, text="✅ Все конфиги отправлены.")
+        
+        # Сохраняем историю
+        context.user_data['last_country'] = context.user_data['country']
+        clear_temporary_data(context)
         return ConversationHandler.END
     
     # Кнопка остановки
@@ -795,6 +821,10 @@ async def send_configs(update: Update, context: CallbackContext):
     else:
         if current_index >= len(matched_configs):
             await context.bot.send_message(chat_id=user_id, text="✅ Все конфиги отправлены.")
+        
+        # Сохраняем историю
+        context.user_data['last_country'] = context.user_data['country']
+        clear_temporary_data(context)
         return ConversationHandler.END
 
 def is_config_relevant(
@@ -818,29 +848,6 @@ def is_config_relevant(
     
     return False
 
-def is_config_relevant_with_neural(
-    config: str, 
-    target_country: str, 
-    country_codes: list,
-    additional_keywords: list = [],
-    additional_patterns: list = []
-) -> bool:
-    """Проверка релевантности конфига с использованием нейросети"""
-    # Стандартные проверки
-    if is_config_relevant(config, target_country, country_codes, additional_keywords, additional_patterns):
-        return True
-    
-    # Проверка с помощью нейросети (если включена)
-    if neural_client:
-        try:
-            neural_country = asyncio.run(neural_detect_country(config))
-            if neural_country and neural_country == target_country:
-                return True
-        except Exception as e:
-            logger.error(f"Ошибка нейросети при проверке конфига: {e}")
-    
-    return False
-
 def strict_config_check(configs: list, target_country: str) -> list:
     """Строгая проверка конфигов с нейросетью"""
     valid_configs = []
@@ -860,8 +867,11 @@ def strict_config_check(configs: list, target_country: str) -> list:
 def validate_config(config: str, target_country: str) -> tuple:
     """Валидация конфига с приоритетом нейросети"""
     try:
+        logger.debug(f"Проверка конфига: {config[:50]}...")
+        
         # Проверка структуры
         if not validate_config_structure(config):
+            logger.debug("Не прошло проверку структуры")
             return (config, False)
         
         # Приоритетная проверка нейросетью
@@ -869,6 +879,7 @@ def validate_config(config: str, target_country: str) -> tuple:
             try:
                 neural_country = asyncio.run(neural_detect_country(config))
                 if neural_country and neural_country == target_country:
+                    logger.debug("Подтверждено нейросетью")
                     return (config, True)
             except Exception as e:
                 logger.error(f"Ошибка нейросети при проверке конфига: {e}")
@@ -876,18 +887,22 @@ def validate_config(config: str, target_country: str) -> tuple:
         # Если нейросеть не подтвердила, делаем стандартную проверку
         host = extract_host(config)
         if not host:
+            logger.debug("Не удалось извлечь хост")
             return (config, False)
         
         # Разрешение DNS (с кэшированием)
         ip = resolve_dns(host)
         if not ip:
+            logger.debug(f"DNS не разрешен для {host}")
             return (config, False)
         
         # Геолокация IP (с кэшированием)
         country = geolocate_ip(ip)
         if country and country.lower() == target_country:
+            logger.debug(f"Геолокация подтвердила: {country}")
             return (config, True)
         
+        logger.debug(f"Геолокация не совпадает: {country} != {target_country}")
         return (config, False)
     except Exception as e:
         logger.error(f"Ошибка проверки конфига: {e}")
@@ -901,13 +916,21 @@ def validate_config_structure(config: str) -> bool:
             padding = '=' * (-len(encoded) % 4)
             decoded = base64.b64decode(encoded + padding).decode('utf-8', errors='replace')
             json_data = json.loads(decoded)
-            required_fields = ['v', 'ps', 'add', 'port', 'id', 'aid']
+            required_fields = ['v', 'add', 'port', 'id']
             return all(field in json_data for field in required_fields)
         except:
             return False
     elif config.startswith('vless://'):
-        pattern = r'vless://[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}@'
-        return bool(re.match(pattern, config))
+        try:
+            parsed = urlparse(config)
+            if not parsed.hostname:
+                return False
+            uuid = parsed.username
+            if not uuid or len(uuid) != 36:
+                return False
+            return True
+        except:
+            return False
     return bool(re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}:\d+\b', config))
 
 def resolve_dns(host: str) -> str:
@@ -926,6 +949,7 @@ def resolve_dns(host: str) -> str:
         dns_cache[host] = ip
         return ip
     except:
+        dns_cache[host] = None  # Кэшируем отрицательный результат
         return None
 
 def geolocate_ip(ip: str) -> str:
@@ -937,6 +961,7 @@ def geolocate_ip(ip: str) -> str:
     try:
         # Пропускаем приватные IP
         if re.match(r'(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)', ip):
+            geo_cache[ip] = None
             return None
         
         # Запрос к API
@@ -951,6 +976,7 @@ def geolocate_ip(ip: str) -> str:
     except Exception as e:
         logger.error(f"Ошибка геолокации для {ip}: {e}")
     
+    geo_cache[ip] = None  # Кэшируем отрицательный результат
     return None
 
 def detect_by_keywords(
@@ -1021,7 +1047,7 @@ def detect_by_keywords(
 
 def extract_host(config: str) -> str:
     """Извлечение хоста из конфига"""
-    if config.startswith(('vmess://', 'vless://')):
+    if config.startswith('vmess://'):
         try:
             encoded = config.split('://')[1].split('?')[0]
             padding = '=' * (-len(encoded) % 4)
@@ -1031,7 +1057,15 @@ def extract_host(config: str) -> str:
             if host:
                 return host
         except Exception as e:
-            logger.debug(f"Ошибка декодирования VMESS/VLESS: {e}")
+            logger.debug(f"Ошибка декодирования VMESS: {e}")
+    elif config.startswith('vless://'):
+        try:
+            parsed = urlparse(config)
+            host = parsed.hostname
+            if host:
+                return host
+        except Exception as e:
+            logger.debug(f"Ошибка парсинга VLESS: {e}")
     
     host_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', config)
     if host_match:
@@ -1057,17 +1091,20 @@ def extract_domain(config: str) -> str:
 
 async def cancel(update: Update, context: CallbackContext):
     """Отмена операции и очистка"""
-    for key in ['file_path', 'file_paths']:
-        if key in context.user_data:
-            file_paths = context.user_data[key]
-            if not isinstance(file_paths, list):
-                file_paths = [file_paths]
-            for file_path in file_paths:
-                if os.path.exists(file_path):
-                    os.unlink(file_path)
-            del context.user_data[key]
+    # Удаляем временные файлы, если есть
+    if 'file_path' in context.user_data:
+        file_path = context.user_data['file_path']
+        if os.path.exists(file_path):
+            os.unlink(file_path)
+        del context.user_data['file_path']
+    if 'file_paths' in context.user_data:
+        for file_path in context.user_data['file_paths']:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+        del context.user_data['file_paths']
     
-    context.user_data.clear()
+    # Очищаем временные данные
+    clear_temporary_data(context)
     await update.message.reply_text("Операция отменена.")
     return ConversationHandler.END
 
@@ -1077,8 +1114,11 @@ def main() -> None:
 
     # Обработчик диалога
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("check_configs", check_configs)],
+        entry_points=[CommandHandler("check_configs", start_check)],
         states={
+            START: [
+                CallbackQueryHandler(start_choice)
+            ],
             WAITING_FILE: [
                 MessageHandler(filters.Document.TEXT, handle_document),
                 MessageHandler(filters.ALL & ~filters.COMMAND, 
