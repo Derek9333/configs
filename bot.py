@@ -73,7 +73,7 @@ def clear_temporary_data(context: CallbackContext):
         'matched_configs', 'current_index', 'stop_sending', 
         'strict_in_progress', 'improved_search', 'country_request', 
         'country', 'target_country', 'country_codes', 'search_mode',
-        'all_configs', 'file_path', 'file_paths'
+        'file_path', 'file_paths'
     ]
     for key in keys_to_clear:
         if key in context.user_data:
@@ -385,13 +385,13 @@ async def button_handler(update: Update, context: CallbackContext) -> int:
     elif query.data == 'fast_mode':
         context.user_data['search_mode'] = 'fast'
         await query.edit_message_text("⚡ Запускаю быстрый поиск...")
-        await process_search(update, context)
+        await fast_search(update, context)  # Прямой вызов
         return WAITING_NUMBER
     
     elif query.data == 'strict_mode':
         context.user_data['search_mode'] = 'strict'
         await query.edit_message_text("🔍 Запускаю строгий поиск...")
-        await strict_search(update, context)
+        await strict_search(update, context)  # Прямой вызов
         return WAITING_NUMBER
     
     elif query.data == 'stop_sending':
@@ -502,44 +502,14 @@ async def handle_country(update: Update, context: CallbackContext):
     )
     return WAITING_MODE
 
-async def process_search(update: Update, context: CallbackContext):
-    """Обработка процесса поиска"""
-    user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
-    country_name = context.user_data.get('country', 'Неизвестная страна')
-    search_mode = context.user_data.get('search_mode', 'fast')
-    
-    logger.info(f"Пользователь {user_id} запросил страну: {country_name} в режиме {search_mode}")
-    
-    # Получение конфигов
-    configs = context.user_data.get('configs', [])
-    if not configs:
-        logger.error("Конфиги не найдены")
-        await context.bot.send_message(chat_id=user_id, text="❌ Ошибка: конфигурации не найдены.")
-        return ConversationHandler.END
-    
-    # Уведомление о количестве конфигов
-    await context.bot.send_message(
-        chat_id=user_id, 
-        text=f"ℹ️ Обрабатывается {len(configs)} конфигов..."
-    )
-    
-    context.user_data['all_configs'] = configs
-    
-    # Выбор режима поиска
-    if search_mode == 'fast':
-        await fast_search(update, context)
-        return WAITING_NUMBER
-    else:
-        await strict_search(update, context)
-        return WAITING_NUMBER
-
 async def fast_search(update: Update, context: CallbackContext):
     """Быстрый поиск конфигов"""
     user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
-    all_configs = context.user_data.get('all_configs', [])
+    # Используем 'configs' вместо 'all_configs'
+    configs = context.user_data.get('configs', [])
     target_country = context.user_data.get('target_country', '')
     
-    if not all_configs or not target_country:
+    if not configs or not target_country:
         await context.bot.send_message(chat_id=user_id, text="❌ Ошибка: данные для поиска отсутствуют.")
         return ConversationHandler.END
     
@@ -553,7 +523,7 @@ async def fast_search(update: Update, context: CallbackContext):
     additional_patterns = improved_search.get('patterns', [])
     
     # Поиск релевантных конфигов
-    for i, config in enumerate(all_configs):
+    for i, config in enumerate(configs):
         try:
             if is_config_relevant(
                 config, 
@@ -571,7 +541,7 @@ async def fast_search(update: Update, context: CallbackContext):
             await context.bot.edit_message_text(
                 chat_id=user_id,
                 message_id=progress_msg.message_id,
-                text=f"🔎 Обработано {i}/{len(all_configs)} конфигов..."
+                text=f"🔎 Обработано {i}/{len(configs)} конфигов..."
             )
     
     # Результаты поиска
@@ -603,10 +573,11 @@ async def fast_search(update: Update, context: CallbackContext):
 async def strict_search(update: Update, context: CallbackContext):
     """Строгий поиск конфигов с проверкой геолокации"""
     user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
-    all_configs = context.user_data.get('all_configs', [])
+    # Используем 'configs' вместо 'all_configs'
+    configs = context.user_data.get('configs', [])
     target_country = context.user_data.get('target_country', '')
     
-    if not all_configs or not target_country:
+    if not configs or not target_country:
         await context.bot.send_message(chat_id=user_id, text="❌ Ошибка: данные для поиска отсутствуют.")
         return ConversationHandler.END
     
@@ -621,7 +592,7 @@ async def strict_search(update: Update, context: CallbackContext):
     additional_patterns = improved_search.get('patterns', [])
     
     # Поиск релевантных конфигов
-    for i, config in enumerate(all_configs):
+    for i, config in enumerate(configs):
         try:
             if is_config_relevant(
                 config, 
@@ -639,7 +610,7 @@ async def strict_search(update: Update, context: CallbackContext):
             await context.bot.edit_message_text(
                 chat_id=user_id,
                 message_id=progress_msg.message_id,
-                text=f"🔎 Этап 1: обработано {i}/{len(all_configs)} конфигов..."
+                text=f"🔎 Этап 1: обработано {i}/{len(configs)} конфигов..."
             )
     
     logger.info(f"Предварительно найдено {len(prelim_configs)} конфигов, обработка заняла {time.time()-start_time:.2f} сек")
