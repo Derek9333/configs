@@ -10,6 +10,7 @@ import time
 import socket
 import concurrent.futures
 import asyncio
+import random
 from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -32,13 +33,11 @@ GEOIP_API = "http://ip-api.com/json/"
 HEADERS = {'User-Agent': 'Telegram V2Ray Config Bot/3.0'}
 MAX_WORKERS = 10
 CHUNK_SIZE = 200
-MAX_CONFIGS_PER_USER = 10000
 NEURAL_MODEL = "deepseek/deepseek-r1-0528"
-CONFIG_CACHE_EXPIRY = 300  # 5 минут
 NEURAL_TIMEOUT = 15  # Таймаут для нейросети
 
 # Состояния диалога
-WAITING_FILE, WAITING_COUNTRY, WAITING_MODE, SENDING_CONFIGS, PROCESSING_STRICT = range(5)
+WAITING_FILE, WAITING_COUNTRY, WAITING_MODE, WAITING_NUMBER, SENDING_CONFIGS, PROCESSING_STRICT = range(6)
 
 # Настройка логирования
 logging.basicConfig(
@@ -65,14 +64,21 @@ geo_cache = {}
 dns_cache = {}
 config_cache = {}
 instruction_cache = {}
+country_normalization_cache = {}
+neural_improvement_cache = {}
 
 def normalize_text(text: str) -> str:
     """Нормализация текста страны для поиска"""
     text = text.lower().strip()
+    
+    # Проверка кэша нормализации
+    if text in country_normalization_cache:
+        return country_normalization_cache[text]
+    
     ru_en_map = {
         "россия": "russia", "русский": "russia", "рф": "russia", "ру": "russia",
         "сша": "united states", "америка": "united states", "usa": "united states", 
-        "us": "united states", "соединенные штаты": "united states",
+        "us": "united states", "соединенные штаты": "united states", "соединённые штаты": "united states",
         "германия": "germany", "дойчланд": "germany", "deutschland": "germany", "де": "germany",
         "япония": "japan", "японии": "japan", "jp": "japan", "яп": "japan",
         "франция": "france", "фр": "france", "франс": "france",
@@ -183,7 +189,7 @@ async def neural_detect_country(config: str) -> str:
     
     system_prompt = (
         "Определи страну для этого V2Ray конфига. Ответь только названием страны на английском в нижнем регистре "
-        "или 'unknown', если не удалось определить."
+        "или 'unknown', если не удалось определить. Учитывай явные указания страны в названии сервера или комментариях."
     )
     try:
         response = neural_client.chat.completions.create(
@@ -236,6 +242,41 @@ async def generate_country_instructions(country: str) -> str:
     except Exception as e:
         logger.error(f"Ошибка генерации инструкций: {e}")
         return f"⚠️ Не удалось сгенерировать инструкцию для {country}"
+
+async def neural_improve_search(country: str) -> dict:
+    """Улучшение поиска с помощью нейросети"""
+    if not neural_client:
+        return None
+    
+    # Проверка кэша
+    if country in neural_improvement_cache:
+        return neural_improvement_cache[country]
+    
+    system_prompt = (
+        "Ты — поисковый агент для бота V2Ray. Сгенерируй улучшенные инструкции для поиска конфигов в указанной стране. "
+        "Верни JSON объект с полями: "
+        "'keywords' (дополнительные ключевые слова для поиска), "
+        "'patterns' (регулярные выражения для идентификации страны в конфигах). "
+        "Пример: {'keywords': ['jp', 'japan', 'tokyo'], 'patterns': [r'\\.jp\\b', r'japan']}"
+    )
+    try:
+        response = neural_client.chat.completions.create(
+            model=NEURAL_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": country}
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=200,
+            temperature=0.3
+        )
+        result = response.choices[0].message.content.strip()
+        improvement = json.loads(result)
+        neural_improvement_cache[country] = improvement  # Кэшируем результат
+        return improvement
+    except Exception as e:
+        logger.error(f"Ошибка улучшения поиска: {e}")
+        return None
 
 async def check_configs(update: Update, context: CallbackContext):
     """Обработчик команды /check_configs"""
@@ -301,14 +342,14 @@ async def button_handler(update: Update, context: CallbackContext) -> int:
         context.user_data['search_mode'] = 'fast'
         await query.edit_message_text("⚡ Запускаю быстрый поиск...")
         await process_search(update, context)
-        return SENDING_CONFIGS
+        return WAITING_NUMBER
     
     elif query.data == 'strict_mode':
         context.user_data['search_mode'] = 'strict'
         await query.edit_message_text("🔍 Запускаю строгий поиск...")
         await strict_search(update, context)
-        return PROCESSING_STRICT    
-        
+        return WAITING_NUMBER
+    
     elif query.data == 'stop_sending':
         context.user_data['stop_sending'] = True
         await query.edit_message_text("⏹ Отправка конфигов остановлена.")
@@ -329,6 +370,7 @@ async def handle_country(update: Update, context: CallbackContext):
     
     logger.info(f"Нормализованный текст: {normalized_text}")
     country = None
+    found_by_neural = False
     
     # Поиск страны через pycountry
     try:
@@ -342,13 +384,42 @@ async def handle_country(update: Update, context: CallbackContext):
             try:
                 countries = pycountry.countries.search_fuzzy(neural_country)
                 country = countries[0]
+                found_by_neural = True
                 logger.info(f"Нейросеть определила страну: {country.name}")
+                
+                # Сохраняем в кэш нормализации
+                country_normalization_cache[country_request] = neural_country
+                if normalized_text != country_request:
+                    country_normalization_cache[normalized_text] = neural_country
             except:
                 logger.warning("Нейросеть не смогла определить страну")
     
     # Если страна не найдена
     if not country:
         logger.warning(f"Страна не распознана: {country_request}")
+        
+        # Попытка улучшить поиск через нейросеть
+        if neural_client:
+            try:
+                improved_search = await neural_improve_search(country_request)
+                if improved_search:
+                    keywords = improved_search.get('keywords', [])
+                    patterns = improved_search.get('patterns', [])
+                    logger.info(f"Улучшенный поиск: keywords={keywords}, patterns={patterns}")
+                    
+                    # Сохраняем улучшения для будущих запросов
+                    context.user_data['improved_search'] = {
+                        'keywords': keywords,
+                        'patterns': patterns
+                    }
+                    
+                    await update.message.reply_text(
+                        f"🔍 Нейросеть улучшила поиск для '{country_request}'. Попробуйте снова."
+                    )
+                    return WAITING_COUNTRY
+            except Exception as e:
+                logger.error(f"Ошибка улучшения поиска: {e}")
+        
         await update.message.reply_text("❌ Страна не распознана. Пожалуйста, уточните название.")
         return WAITING_COUNTRY
 
@@ -411,8 +482,6 @@ async def process_search(update: Update, context: CallbackContext):
                     if line:
                         all_configs.append(line)
                         total_lines += 1
-                        if total_lines >= MAX_CONFIGS_PER_USER:
-                            break
             logger.info(f"Файл прочитан: {len(all_configs)} конфигов, за {time.time()-start_time:.2f} сек")
         except Exception as e:
             logger.error(f"Ошибка чтения файла: {e}")
@@ -422,23 +491,21 @@ async def process_search(update: Update, context: CallbackContext):
         await context.bot.send_message(chat_id=user_id, text="❌ В файлах не найдено конфигураций.")
         return ConversationHandler.END
     
-    # Ограничение количества конфигов
-    if len(all_configs) > MAX_CONFIGS_PER_USER:
-        all_configs = all_configs[:MAX_CONFIGS_PER_USER]
-        await context.bot.send_message(
-            chat_id=user_id, 
-            text=f"⚠️ Внимание: обрабатывается только первые {MAX_CONFIGS_PER_USER} конфигов."
-        )
+    # Уведомление о количестве конфигов
+    await context.bot.send_message(
+        chat_id=user_id, 
+        text=f"ℹ️ Обрабатывается {len(all_configs)} конфигов..."
+    )
     
     context.user_data['all_configs'] = all_configs
     
     # Выбор режима поиска
     if search_mode == 'fast':
         await fast_search(update, context)
-        return SENDING_CONFIGS
+        return WAITING_NUMBER
     else:
         await strict_search(update, context)
-        return PROCESSING_STRICT
+        return WAITING_NUMBER
 
 async def fast_search(update: Update, context: CallbackContext):
     """Быстрый поиск конфигов"""
@@ -454,13 +521,21 @@ async def fast_search(update: Update, context: CallbackContext):
     matched_configs = []
     progress_msg = await context.bot.send_message(chat_id=user_id, text="🔎 Начинаю быстрый поиск...")
     
+    # Применяем улучшения поиска если есть
+    improved_search = context.user_data.get('improved_search', {})
+    additional_keywords = improved_search.get('keywords', [])
+    additional_patterns = improved_search.get('patterns', [])
+    
     # Поиск релевантных конфигов
     for i, config in enumerate(all_configs):
-        if context.user_data.get('stop_sending'):
-            break
-            
         try:
-            if is_config_relevant(config, target_country, context.user_data['country_codes']):
+            if is_config_relevant(
+                config, 
+                target_country, 
+                context.user_data['country_codes'],
+                additional_keywords,
+                additional_patterns
+            ):
                 matched_configs.append(config)
         except Exception as e:
             logger.error(f"Ошибка проверки конфига #{i}: {e}")
@@ -484,21 +559,23 @@ async def fast_search(update: Update, context: CallbackContext):
         )
         return ConversationHandler.END
     
-    # Отправка результатов
+    # Сохраняем результаты
     context.user_data['matched_configs'] = matched_configs
-    context.user_data['current_index'] = 0
-    context.user_data['stop_sending'] = False
     
     await context.bot.edit_message_text(
         chat_id=user_id,
         message_id=progress_msg.message_id,
-        text=f"✅ Найдено {len(matched_configs)} конфигов для {context.user_data['country']}! Начинаю отправку..."
+        text=f"✅ Найдено {len(matched_configs)} конфигов для {context.user_data['country']}!"
     )
     
-    await send_configs(update, context)
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=f"🌍 Для страны {context.user_data['country']} найдено {len(matched_configs)} конфигов. Сколько конфигов прислать? (введите число от 1 до {len(matched_configs)})"
+    )
+    return WAITING_NUMBER
 
 async def strict_search(update: Update, context: CallbackContext):
-    """Строгий поиск конфигов с проверкой и отправкой по мере нахождения"""
+    """Улучшенный строгий поиск конфигов с нейросетью"""
     user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
     all_configs = context.user_data.get('all_configs', [])
     target_country = context.user_data.get('target_country', '')
@@ -512,13 +589,27 @@ async def strict_search(update: Update, context: CallbackContext):
     prelim_configs = []
     progress_msg = await context.bot.send_message(chat_id=user_id, text="🔎 Этап 1: предварительная фильтрация...")
     
+    # Применяем улучшения поиска если есть
+    improved_search = context.user_data.get('improved_search', {})
+    additional_keywords = improved_search.get('keywords', [])
+    additional_patterns = improved_search.get('patterns', [])
+    
+    # Нейросетевой анализ для улучшения поиска
+    neural_improvement = await neural_improve_search(target_country)
+    if neural_improvement:
+        additional_keywords.extend(neural_improvement.get('keywords', []))
+        additional_patterns.extend(neural_improvement.get('patterns', []))
+    
     for i, config in enumerate(all_configs):
-        if context.user_data.get('stop_sending'):
-            break
-            
         try:
             # Используем нейросеть для улучшения предварительной фильтрации
-            if is_config_relevant_with_neural(config, target_country, context.user_data['country_codes']):
+            if is_config_relevant_with_neural(
+                config, 
+                target_country, 
+                context.user_data['country_codes'],
+                additional_keywords,
+                additional_patterns
+            ):
                 prelim_configs.append(config)
         except Exception as e:
             logger.error(f"Ошибка быстрой проверки конфига #{i}: {e}")
@@ -541,7 +632,7 @@ async def strict_search(update: Update, context: CallbackContext):
         )
         return ConversationHandler.END
     
-    # Этап 2: строгая проверка
+    # Этап 2: строгая проверка с нейросетью
     total_chunks = (len(prelim_configs) + CHUNK_SIZE - 1) // CHUNK_SIZE
     # Создаем клавиатуру с кнопкой остановки
     stop_keyboard = [[InlineKeyboardButton("⏹ Остановить строгий поиск", callback_data='stop_strict_search')]]
@@ -568,27 +659,9 @@ async def strict_search(update: Update, context: CallbackContext):
         chunk = prelim_configs[start_idx:end_idx]
         chunk_start_time = time.time()
         
-        # Параллельная проверка конфигов
+        # Параллельная проверка конфигов с нейросетью
         valid_configs = strict_config_check(chunk, target_country)
         strict_matched_configs.extend(valid_configs)
-        
-        # Сохраняем найденные конфиги для отправки
-        context.user_data['matched_configs'] = valid_configs
-        context.user_data['current_index'] = 0
-        context.user_data['country'] = context.user_data.get('country', '')
-        
-        # Отправляем найденные в этом чанке конфиги
-        if valid_configs:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"✅ В секторе {chunk_idx+1}/{total_chunks} найдено {len(valid_configs)} конфигов:"
-            )
-            await send_configs(update, context)  # Отправляем пачками
-        else:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"ℹ️ В секторе {chunk_idx+1}/{total_chunks} конфигов не найдено."
-            )
         
         # Обновляем сообщение прогресса
         chunk_time = time.time() - chunk_start_time
@@ -608,25 +681,67 @@ async def strict_search(update: Update, context: CallbackContext):
     total_time = time.time() - start_time
     logger.info(f"Строгая проверка завершена: найдено {len(strict_matched_configs)} конфигов, заняло {total_time:.2f} сек")
     
+    if context.user_data.get('stop_strict_search'):
+        # Удаляем кнопку остановки, редактируя сообщение
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=progress_msg.message_id,
+            text=f"⏹ Строгий поиск остановлен. Найдено {len(strict_matched_configs)} конфигов."
+        )
+    else:
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=progress_msg.message_id,
+            text=f"✅ Строгий поиск завершен. Найдено {len(strict_matched_configs)} конфигов."
+        )
+    
     if not strict_matched_configs:
-        await context.bot.send_message(chat_id=user_id, text=f"❌ Конфигурации для {context.user_data['country']} не найдены.")
+        await context.bot.send_message(chat_id=user_id, text="❌ Конфигурации не найдены.")
         return ConversationHandler.END
     
-    # Сохраняем все найденные конфиги для возможной повторной отправки
+    # Сохраняем все найденные конфиги
     context.user_data['matched_configs'] = strict_matched_configs
-    context.user_data['current_index'] = 0
-    context.user_data['stop_sending'] = False
     
     await context.bot.send_message(
         chat_id=user_id,
-        text=f"✅ Всего найдено {len(strict_matched_configs)} валидных конфигов для {context.user_data['country']}!"
+        text=f"🌍 Для страны {context.user_data['country']} найдено {len(strict_matched_configs)} валидных конфигов! Сколько конфигов прислать? (введите число от 1 до {len(strict_matched_configs)})"
     )
+    return WAITING_NUMBER
+
+async def handle_number(update: Update, context: CallbackContext):
+    """Обработка ввода количества конфигов"""
+    user_input = update.message.text
+    user_id = update.message.from_user.id
     
-    return ConversationHandler.END
+    try:
+        num = int(user_input)
+        matched_configs = context.user_data.get('matched_configs', [])
+        total = len(matched_configs)
+        
+        if num < 1:
+            num = 1
+        if num > total:
+            num = total
+        
+        # Перемешиваем конфиги для случайной выборки
+        random.shuffle(matched_configs)
+        selected_configs = matched_configs[:num]
+        
+        # Сохраняем выбранные конфиги
+        context.user_data['matched_configs'] = selected_configs
+        context.user_data['current_index'] = 0
+        context.user_data['stop_sending'] = False
+        
+        await update.message.reply_text(f"⏫ Начинаю отправку {num} конфигов...")
+        await send_configs(update, context)
+        return SENDING_CONFIGS
+    except ValueError:
+        await update.message.reply_text("❌ Пожалуйста, введите число.")
+        return WAITING_NUMBER
 
 async def send_configs(update: Update, context: CallbackContext):
     """Отправка конфигов пользователю"""
-    user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
+    user_id = update.message.from_user.id
     matched_configs = context.user_data.get('matched_configs', [])
     current_index = context.user_data.get('current_index', 0)
     country_name = context.user_data.get('country', '')
@@ -682,10 +797,16 @@ async def send_configs(update: Update, context: CallbackContext):
             await context.bot.send_message(chat_id=user_id, text="✅ Все конфиги отправлены.")
         return ConversationHandler.END
 
-def is_config_relevant(config: str, target_country: str, country_codes: list) -> bool:
+def is_config_relevant(
+    config: str, 
+    target_country: str, 
+    country_codes: list,
+    additional_keywords: list = [],
+    additional_patterns: list = []
+) -> bool:
     """Проверка релевантности конфига"""
     # Проверка по ключевым словам
-    if detect_by_keywords(config, target_country):
+    if detect_by_keywords(config, target_country, additional_keywords, additional_patterns):
         return True
     
     # Проверка по домену
@@ -697,14 +818,20 @@ def is_config_relevant(config: str, target_country: str, country_codes: list) ->
     
     return False
 
-def is_config_relevant_with_neural(config: str, target_country: str, country_codes: list) -> bool:
+def is_config_relevant_with_neural(
+    config: str, 
+    target_country: str, 
+    country_codes: list,
+    additional_keywords: list = [],
+    additional_patterns: list = []
+) -> bool:
     """Проверка релевантности конфига с использованием нейросети"""
     # Стандартные проверки
-    if is_config_relevant(config, target_country, country_codes):
+    if is_config_relevant(config, target_country, country_codes, additional_keywords, additional_patterns):
         return True
     
-    # Проверка с помощью нейросети (если включена и конфиг не слишком длинный)
-    if neural_client and len(config) < 500:
+    # Проверка с помощью нейросети (если включена)
+    if neural_client:
         try:
             neural_country = asyncio.run(neural_detect_country(config))
             if neural_country and neural_country == target_country:
@@ -715,7 +842,7 @@ def is_config_relevant_with_neural(config: str, target_country: str, country_cod
     return False
 
 def strict_config_check(configs: list, target_country: str) -> list:
-    """Строгая проверка конфигов"""
+    """Строгая проверка конфигов с нейросетью"""
     valid_configs = []
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -731,13 +858,22 @@ def strict_config_check(configs: list, target_country: str) -> list:
     return valid_configs
 
 def validate_config(config: str, target_country: str) -> tuple:
-    """Валидация конфига"""
+    """Валидация конфига с приоритетом нейросети"""
     try:
         # Проверка структуры
         if not validate_config_structure(config):
             return (config, False)
         
-        # Получение хоста
+        # Приоритетная проверка нейросетью
+        if neural_client:
+            try:
+                neural_country = asyncio.run(neural_detect_country(config))
+                if neural_country and neural_country == target_country:
+                    return (config, True)
+            except Exception as e:
+                logger.error(f"Ошибка нейросети при проверке конфига: {e}")
+        
+        # Если нейросеть не подтвердила, делаем стандартную проверку
         host = extract_host(config)
         if not host:
             return (config, False)
@@ -751,15 +887,6 @@ def validate_config(config: str, target_country: str) -> tuple:
         country = geolocate_ip(ip)
         if country and country.lower() == target_country:
             return (config, True)
-        
-        # Проверка нейросетью
-        if neural_client and len(config) < 500:
-            try:
-                neural_country = asyncio.run(neural_detect_country(config))
-                if neural_country and neural_country == target_country:
-                    return (config, True)
-            except Exception as e:
-                logger.error(f"Ошибка нейросети при проверке конфига: {e}")
         
         return (config, False)
     except Exception as e:
@@ -826,7 +953,12 @@ def geolocate_ip(ip: str) -> str:
     
     return None
 
-def detect_by_keywords(config: str, target_country: str) -> bool:
+def detect_by_keywords(
+    config: str, 
+    target_country: str,
+    additional_keywords: list = [],
+    additional_patterns: list = []
+) -> bool:
     """Обнаружение страны по ключевым словам"""
     patterns = {
         'japan': [r'jp\b', r'japan', r'tokyo', r'\.jp\b', r'日本', r'東京'],
@@ -875,6 +1007,11 @@ def detect_by_keywords(config: str, target_country: str) -> bool:
         "belgium": [r'belgium', r'brussels', r'\.be\b', r'比利时', r'布鲁塞尔'],
         "ireland": [r'ireland', r'dublin', r'\.ie\b', r'爱尔兰', r'都柏林']
     }
+    
+    # Добавляем дополнительные ключевые слова и шаблоны
+    if target_country in patterns:
+        patterns[target_country].extend(additional_keywords)
+        patterns[target_country].extend(additional_patterns)
     
     if target_country in patterns:
         for pattern in patterns[target_country]:
@@ -953,6 +1090,9 @@ def main() -> None:
             ],
             WAITING_MODE: [
                 CallbackQueryHandler(button_handler)
+            ],
+            WAITING_NUMBER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_number)
             ],
             SENDING_CONFIGS: [
                 CallbackQueryHandler(button_handler)
