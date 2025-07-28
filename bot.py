@@ -227,7 +227,7 @@ async def neural_detect_country(config: str) -> str:
 async def generate_country_instructions(country: str) -> str:
     """Генерация инструкций для страны с помощью нейросети"""
     if not neural_client:
-        return "Инструкции недоступны (нейросеть отключена)"
+        return "Инструкции недоступны ( нейросеть отключена)"
     
     # Проверка кэша
     if country in instruction_cache:
@@ -402,6 +402,10 @@ async def button_handler(update: Update, context: CallbackContext) -> int:
     elif query.data == 'stop_strict_search':
         context.user_data['stop_strict_search'] = True
         await query.edit_message_text("⏹ Строгий поиск остановлен.")
+        return ConversationHandler.END
+    
+    elif query.data == 'cancel':
+        await cancel(update, context)
         return ConversationHandler.END
     
     return context.user_data.get('current_state', WAITING_COUNTRY)
@@ -597,7 +601,7 @@ async def fast_search(update: Update, context: CallbackContext):
     return WAITING_NUMBER
 
 async def strict_search(update: Update, context: CallbackContext):
-    """Улучшенный строгий поиск конфигов с нейросетью"""
+    """Строгий поиск конфигов с проверкой геолокации"""
     user_id = update.callback_query.from_user.id if update.callback_query else update.message.from_user.id
     all_configs = context.user_data.get('all_configs', [])
     target_country = context.user_data.get('target_country', '')
@@ -616,15 +620,9 @@ async def strict_search(update: Update, context: CallbackContext):
     additional_keywords = improved_search.get('keywords', [])
     additional_patterns = improved_search.get('patterns', [])
     
-    # Нейросетевой анализ для улучшения поиска
-    neural_improvement = await neural_improve_search(target_country)
-    if neural_improvement:
-        additional_keywords.extend(neural_improvement.get('keywords', []))
-        additional_patterns.extend(neural_improvement.get('patterns', []))
-    
+    # Поиск релевантных конфигов
     for i, config in enumerate(all_configs):
         try:
-            # Используем быструю проверку без нейросети для предварительной фильтрации
             if is_config_relevant(
                 config, 
                 target_country, 
@@ -634,9 +632,9 @@ async def strict_search(update: Update, context: CallbackContext):
             ):
                 prelim_configs.append(config)
         except Exception as e:
-            logger.error(f"Ошибка быстрой проверки конфига #{i}: {e}")
+            logger.error(f"Ошибка проверки конфига #{i}: {e}")
         
-        # Обновление прогресса
+        # Обновление прогресса каждые 500 конфигов
         if i % 500 == 0 and i > 0:
             await context.bot.edit_message_text(
                 chat_id=user_id,
@@ -654,7 +652,7 @@ async def strict_search(update: Update, context: CallbackContext):
         )
         return ConversationHandler.END
     
-    # Этап 2: строгая проверка с нейросетью
+    # Этап 2: строгая проверка через геолокацию IP
     total_chunks = (len(prelim_configs) + CHUNK_SIZE - 1) // CHUNK_SIZE
     # Создаем клавиатуру с кнопкой остановки
     stop_keyboard = [[InlineKeyboardButton("⏹ Остановить строгий поиск", callback_data='stop_strict_search')]]
@@ -663,7 +661,7 @@ async def strict_search(update: Update, context: CallbackContext):
     await context.bot.edit_message_text(
         chat_id=user_id,
         message_id=progress_msg.message_id,
-        text=f"🔍 Начинаю строгую проверку {len(prelim_configs)} конфигов секторами по {CHUNK_SIZE}...\n"
+        text=f"🌐 Начинаю проверку геолокации {len(prelim_configs)} конфигов...\n"
         f"Всего секторов: {total_chunks}",
         reply_markup=stop_reply_markup
     )
@@ -672,8 +670,9 @@ async def strict_search(update: Update, context: CallbackContext):
     strict_matched_configs = []
     context.user_data['strict_in_progress'] = True  # Флаг, что строгий поиск в процессе
     
+    # Обрабатываем чанки конфигов
     for chunk_idx in range(total_chunks):
-        if context.user_data.get('stop_sending') or context.user_data.get('stop_strict_search'):
+        if context.user_data.get('stop_strict_search'):
             break
             
         start_idx = chunk_idx * CHUNK_SIZE
@@ -681,8 +680,8 @@ async def strict_search(update: Update, context: CallbackContext):
         chunk = prelim_configs[start_idx:end_idx]
         chunk_start_time = time.time()
         
-        # Параллельная проверка конфигов с нейросетью
-        valid_configs = strict_config_check(chunk, target_country)
+        # Проверяем конфиги в чанке
+        valid_configs = validate_configs_by_geolocation(chunk, target_country)
         strict_matched_configs.extend(valid_configs)
         
         # Обновляем сообщение прогресса
@@ -690,7 +689,7 @@ async def strict_search(update: Update, context: CallbackContext):
         await context.bot.edit_message_text(
             chat_id=user_id,
             message_id=progress_msg.message_id,
-            text=f"🔍 Обработан сектор {chunk_idx+1}/{total_chunks}\n"
+            text=f"🌐 Обработан сектор {chunk_idx+1}/{total_chunks}\n"
                  f"Найдено конфигов: {len(valid_configs)}\n"
                  f"Время обработки: {chunk_time:.1f} сек\n"
                  f"Всего найдено: {len(strict_matched_configs)}",
@@ -848,65 +847,54 @@ def is_config_relevant(
     
     return False
 
-def strict_config_check(configs: list, target_country: str) -> list:
-    """Строгая проверка конфигов с нейросетью"""
+def validate_configs_by_geolocation(configs: list, target_country: str) -> list:
+    """Проверка конфигов по геолокации IP"""
     valid_configs = []
     
+    # Используем ThreadPoolExecutor для параллельной обработки
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
-        for config in configs:
-            futures.append(executor.submit(validate_config, config, target_country))
+        # Создаем задачи для каждого конфига
+        futures = {executor.submit(validate_config_by_geolocation, config, target_country): config for config in configs}
         
+        # Обрабатываем результаты по мере их готовности
         for future in concurrent.futures.as_completed(futures):
-            config, is_valid = future.result()
-            if is_valid:
-                valid_configs.append(config)
+            config = futures[future]
+            try:
+                if future.result():
+                    valid_configs.append(config)
+            except Exception as e:
+                logger.error(f"Ошибка проверки конфига: {e}")
     
     return valid_configs
 
-def validate_config(config: str, target_country: str) -> tuple:
-    """Валидация конфига с приоритетом нейросети"""
+def validate_config_by_geolocation(config: str, target_country: str) -> bool:
+    """Проверка конфига по геолокации IP"""
     try:
-        logger.debug(f"Проверка конфига: {config[:50]}...")
-        
-        # Проверка структуры
+        # Пропускаем невалидные конфиги
         if not validate_config_structure(config):
-            logger.debug("Не прошло проверку структуры")
-            return (config, False)
+            return False
         
-        # Приоритетная проверка нейросетью
-        if neural_client:
-            try:
-                neural_country = asyncio.run(neural_detect_country(config))
-                if neural_country and neural_country == target_country:
-                    logger.debug("Подтверждено нейросетью")
-                    return (config, True)
-            except Exception as e:
-                logger.error(f"Ошибка нейросети при проверке конфига: {e}")
-        
-        # Если нейросеть не подтвердила, делаем стандартную проверку
+        # Извлекаем хост из конфига
         host = extract_host(config)
         if not host:
-            logger.debug("Не удалось извлечь хост")
-            return (config, False)
+            return False
         
-        # Разрешение DNS (с кэшированием)
+        # Разрешаем DNS (если это домен)
         ip = resolve_dns(host)
         if not ip:
-            logger.debug(f"DNS не разрешен для {host}")
-            return (config, False)
+            return False
         
-        # Геолокация IP (с кэшированием)
+        # Получаем страну по IP
         country = geolocate_ip(ip)
-        if country and country.lower() == target_country:
-            logger.debug(f"Геолокация подтвердила: {country}")
-            return (config, True)
+        if not country:
+            return False
         
-        logger.debug(f"Геолокация не совпадает: {country} != {target_country}")
-        return (config, False)
+        # Сравниваем страну с целевой
+        return country.lower() == target_country.lower()
+    
     except Exception as e:
         logger.error(f"Ошибка проверки конфига: {e}")
-        return (config, False)
+        return False
 
 def validate_config_structure(config: str) -> bool:
     """Проверка структуры конфига"""
